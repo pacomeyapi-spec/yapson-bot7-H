@@ -1,0 +1,791 @@
+// ============================================================
+// yapson-bot7-h — Multi-fournisseurs avec capture d'écran
+// Logique: fournisseur par fournisseur, réseau auto-détecté
+// Confirmation avec fichier image obligatoire
+// ============================================================
+
+const express  = require('express');
+const fetch    = require('node-fetch');
+const FormData = require('form-data');
+
+const app  = express();
+const PORT = process.env.PORT || 8080;
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// ── Mapping réseau ────────────────────────────────────────────
+const NET_UUIDS = {
+  'MOOV CI'  : '24462fd9-c8e2-42f2-a95f-119844bc2ada',
+  'MTN CI'   : '77e8e729-a0f1-4e1b-8614-168c77f4b101',
+  'ORANGE CI': '938988bf-d571-4eac-befb-40644c20976a',
+  'Orangeint': '6fbc14c6-2b0b-431a-afce-2c371b33b2a3',
+  'Wave'     : '97847ae3-6c50-4116-a6da-a69695afbaaa',
+};
+
+// Détecte le réseau yapson depuis le titre my-managment
+function detectNetwork(title) {
+  const t = (title || '').toLowerCase();
+  if (t.includes('wave'))   return 'Wave';
+  if (t.includes('mtn'))    return 'MTN CI';
+  if (t.includes('moov'))   return 'MOOV CI';
+  if (t.includes('orange')) return 'Orangeint';
+  return 'Orangeint'; // fallback
+}
+
+// ── Config ────────────────────────────────────────────────────
+let cfg = {
+  mgmtCookies  : process.env.MGMT_COOKIES   || '',
+  yapsonToken  : '',  // Injecter via le dashboard (section COMPTES)
+  reportId     : process.env.REPORT_ID      || '8231c3be3216307da83c067d263c09ec',
+  pollInterval : parseInt(process.env.POLL_INTERVAL || '600'),
+  maxSolde     : parseInt(process.env.MAX_SOLDE || '0'),
+};
+
+const stats = { confirmed: 0, missing: 0, fixed: 0, polls: 0, rejected: 0 };
+const logs  = [];
+let pollTimer = null, isRunning = false, botActive = false;
+
+function addLog(type, msg) {
+  const ts = new Date().toISOString().replace('T',' ').substring(0,19);
+  logs.unshift({ ts, type, msg });
+  if (logs.length > 500) logs.pop();
+  console.log(`[${type.toUpperCase()}] ${ts} — ${msg}`);
+}
+
+function parseCookies(raw) {
+  if (!raw) return '';
+  let s = raw.trim();
+
+  // Auto-nettoyage : supprimer les préfixes pollués type "(configuré...)" qui peuvent
+  // s'être glissés en cas de copie sur le placeholder du textarea sans effacer
+  s = s.replace(/^\([^)]*\)\s*/, '');  // retire (xxx) en début
+  s = s.replace(/^[^[a-zA-Z]+/, '');    // retire tout caractère non-alphanumérique en début (sauf [ pour JSON)
+  s = s.trim();
+
+  if (!s) return '';
+
+  // Format JSON Firefox : [{name, value, ...}]
+  if (s.startsWith('[')) {
+    try {
+      const arr = JSON.parse(s);
+      if (Array.isArray(arr)) {
+        return arr
+          .filter(c => c.name && c.value !== undefined)
+          .map(c => {
+            const v = String(c.value)
+              .replace(/[\r\n\t]/g, '')
+              .replace(/[^\x20-\x7E]/g, '')
+              .trim();
+            return c.name.trim() + '=' + v;
+          })
+          .join('; ');
+      }
+    } catch(e) {}
+  }
+  // Format string — nettoyer
+  return s.replace(/[\r\n]/g, '').trim();
+}
+
+function getCookieStr() { return parseCookies(cfg.mgmtCookies); }
+
+function mgmtH() {
+  return {
+    'Accept'           : 'application/json, text/plain, */*',
+    'Content-Type'     : 'application/json',
+    'X-Requested-With' : 'XMLHttpRequest',
+    'X-Time-Zone'      : 'GMT+00',
+    'Cookie'           : getCookieStr(),
+    'User-Agent'       : 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+    'Referer'          : 'https://my-managment.com/fr/admin/report/pendingrequestwithdrawal',
+  };
+}
+function yapH() {
+  return { 'Content-Type':'application/json', 'Authorization': `Bearer ${cfg.yapsonToken}` };
+}
+
+// ── Lire TOUS les retraits et grouper par fournisseur ─────────
+async function getAllWithdrawals() {
+  const res = await fetch('https://my-managment.com/admin/report/pendingrequestwithdrawal', {
+    method:'POST', headers:mgmtH(), body:JSON.stringify({page:1,limit:500}),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} — cookies expirés ?`);
+  const data = await res.json();
+  if (data.is_guest) throw new Error('Session expirée — injecter nouveaux cookies');
+  const rows = data.data || [];
+
+  // Grouper par subagent_id (fournisseur)
+  const groups = {};
+  for (const row of rows) {
+    const montant = row.summa_sort || parseInt((row.summa||'').replace(/[^0-9]/g,''))||0;
+    const phone   = row.dopparam?.[0]?.description || '';
+    const netTitle= row.dopparam?.[0]?.title || '';
+    const pm      = String(phone).match(/0[0-9]{9}/);
+    const cd      = row.confirm?.[0]?.data || null;
+    const sid     = cd?.subagent_id;
+    const filesRequired = cd?.files_required || 0;
+    const subagentName  = row.subagent || `Fournisseur_${sid}`;
+
+    if (!pm || montant <= 0 || !cd || !sid) continue;
+
+    if (!groups[sid]) {
+      groups[sid] = {
+        subagent_id  : sid,
+        subagentName : subagentName,
+        netTitle     : netTitle,
+        network      : detectNetwork(netTitle),
+        filesRequired: filesRequired,
+        items        : [],
+      };
+    }
+    groups[sid].items.push({ phone:pm[0], montant, confirmData:cd, netTitle });
+  }
+  return groups;
+}
+
+// ── Décaissement yapson ───────────────────────────────────────
+async function payout(item, network) {
+  const uuid = NET_UUIDS[network] || NET_UUIDS['Orangeint'];
+  const res  = await fetch('https://connect.yapson.net/api/aggregator/payout/', {
+    method:'POST', headers:yapH(),
+    body:JSON.stringify({ amount:item.montant, recipient_phone:item.phone, network:uuid }),
+  });
+  const body = await res.json().catch(()=>({}));
+  // Log la réponse complète pour debug
+  addLog('info', `  🔍 Payout réponse [${res.status}]: ${JSON.stringify(body).substring(0,120)}`);
+  if (res.status===200||res.status===201) {
+    const uid = body.uid || body.id || body.reference || null;
+    return { ok:true, uid, phone: item.phone, montant: item.montant };
+  }
+  return { ok:false, err:JSON.stringify(body).substring(0,100) };
+}
+
+// ── Attendre que la transaction passe en SUCCESS ──────────────
+async function waitForSuccess(uid, phone, maxWait=120000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWait) {
+    await sleep(5000);
+    try {
+      let tx = null;
+      // Normaliser le numéro: 0XXXXXXXXX <-> 225XXXXXXXXX
+      function normalizePhone(p) {
+        const s = String(p).replace(/[^0-9]/g,'');
+        if (s.startsWith('225')) return s.substring(3); // 2250XXXXXXXX -> 0XXXXXXXX
+        if (s.startsWith('0') && s.length === 10) return s; // 0XXXXXXXX ok
+        return s;
+      }
+      const phoneNorm = normalizePhone(phone);
+      // Si uid connu: appel direct
+      if (uid) {
+        const res = await fetch(`https://connect.yapson.net/api/aggregator/transactions/${uid}/`, {
+          headers: yapH(),
+        });
+        tx = await res.json();
+      } else {
+        // Chercher par téléphone dans les 50 dernières transactions
+        const res = await fetch('https://connect.yapson.net/api/aggregator/transactions/?limit=50', {
+          headers: yapH(),
+        });
+        const data = await res.json();
+        const results = data.results || data.data || [];
+        tx = results.find(t => {
+          const tNorm = normalizePhone(t.recipient_phone);
+          return tNorm === phoneNorm && (t.status === 'pending' || t.status === 'success');
+        });
+      }
+      if (!tx) { addLog('info', `⏳ Transaction introuvable pour ${phone} (${phoneNorm})...`); continue; }
+      if (tx.status === 'success') return { ok:true, tx };
+      if (tx.status === 'failed')  return { ok:false, err:`Transaction échouée: ${tx.error_message||''}` };
+      addLog('info', `⏳ ${(tx.uid||phone).substring(0,8)} status=${tx.status}...`);
+    } catch(e) { addLog('info', `⏳ attente...`); }
+  }
+  return { ok:false, err:'Timeout — transaction non confirmée après 2min' };
+}
+
+// ── Générer une capture SMS-like avec @napi-rs/canvas ─────────
+async function generateTxScreenshot(tx) {
+  const dt = (tx.completed_at || tx.created_at || new Date().toISOString())
+    .replace('T',' ').substring(0,19);
+  const ref = tx.reference || tx.uid || 'N/A';
+  const phone = tx.recipient_phone || '';
+  const amount = parseInt(tx.amount || 0).toLocaleString('fr-FR');
+  const network = (tx.network_name || tx.network || '').toUpperCase();
+
+  // Formatter la date au format SMS local: "le 03-05-2026 10:41:14"
+  const dateMatch = dt.match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}:\d{2}:\d{2})/);
+  const dateFmt = dateMatch
+    ? `le ${dateMatch[3]}-${dateMatch[2]}-${dateMatch[1]} ${dateMatch[4]}`
+    : dt;
+
+  // ID transaction court (10 derniers chars de la ref)
+  const idTx = String(ref).replace(/[^0-9A-Z]/gi,'').slice(-10).toUpperCase();
+
+  // Couleurs en fonction du network
+  const netColors = {
+    'WAVE'    : { bg:'#1e88ff', accent:'#1e88ff' },
+    'ORANGE'  : { bg:'#ff6b00', accent:'#ff6b00' },
+    'MTN'     : { bg:'#ffd700', accent:'#000000' },
+    'MOOV'    : { bg:'#0088cc', accent:'#0088cc' },
+    'ORANGEINT': { bg:'#ff6b00', accent:'#ff6b00' },
+    'MTN CI'  : { bg:'#ffd700', accent:'#000000' },
+    'MOOV CI' : { bg:'#0088cc', accent:'#0088cc' },
+  };
+  let netKey = network;
+  for (const k of Object.keys(netColors)) {
+    if (network.includes(k.split(' ')[0])) { netKey = k; break; }
+  }
+  const colors = netColors[netKey] || { bg:'#1e88ff', accent:'#1e88ff' };
+
+  try {
+    const { createCanvas } = require('@napi-rs/canvas');
+    const W = 600, H = 360;
+    const canvas = createCanvas(W, H);
+    const ctx = canvas.getContext('2d');
+
+    // Fond gris clair (style messagerie)
+    ctx.fillStyle = '#f5f5f7';
+    ctx.fillRect(0, 0, W, H);
+
+    // Carte SMS arrondie (rectangle blanc avec bordure subtile)
+    ctx.fillStyle = '#ffffff';
+    roundRect(ctx, 20, 20, W-40, H-40, 12, true, false);
+    ctx.strokeStyle = '#e0e0e0';
+    ctx.lineWidth = 1;
+    roundRect(ctx, 20, 20, W-40, H-40, 12, false, true);
+
+    // Badge "SMS" en haut à gauche
+    ctx.fillStyle = '#e3f2fd';
+    roundRect(ctx, 40, 40, 60, 26, 6, true, false);
+    ctx.fillStyle = '#1976d2';
+    ctx.font = 'bold 13px sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('SMS', 56, 53);
+
+    // Date à droite
+    ctx.fillStyle = '#999999';
+    ctx.font = '12px sans-serif';
+    ctx.textAlign = 'right';
+    const dispDate = dateMatch
+      ? `${dateMatch[3]}/${dateMatch[2]}/${dateMatch[1]} ${dateMatch[4].substring(0,5)}`
+      : dt;
+    ctx.fillText(dispDate, W-40, 53);
+    ctx.textAlign = 'left';
+
+    // Numéro de téléphone (avec préfixe TEL au lieu d'emoji)
+    ctx.fillStyle = '#fff3e0';
+    roundRect(ctx, 40, 90, 220, 36, 8, true, false);
+    ctx.fillStyle = '#ff6b00';
+    ctx.font = 'bold 18px sans-serif';
+    ctx.fillText('TEL  ' + phone, 52, 108);
+
+    // Texte du message principal
+    ctx.fillStyle = '#222222';
+    ctx.font = '15px sans-serif';
+    const msgLine1 = `Vous avez envoye ${amount} FCFA au`;
+    ctx.fillText(msgLine1, 40, 165);
+
+    // Numéro destinataire en bleu cliquable
+    ctx.fillStyle = '#e3f2fd';
+    const phoneLabel = ` +225 ${phone} `;
+    ctx.font = 'bold 15px sans-serif';
+    const phoneW = ctx.measureText(phoneLabel).width;
+    roundRect(ctx, 40, 180, phoneW, 24, 4, true, false);
+    ctx.fillStyle = '#1976d2';
+    ctx.fillText(phoneLabel, 40, 197);
+
+    // Suite du message
+    ctx.fillStyle = '#222222';
+    ctx.font = '15px sans-serif';
+    ctx.fillText(`${dateFmt}.`, 40 + phoneW + 5, 197);
+
+    // Solde / ID Transaction
+    ctx.fillStyle = '#222222';
+    ctx.font = '15px sans-serif';
+    ctx.fillText(`Votre nouveau solde est de: confirmé.`, 40, 230);
+    ctx.fillText(`ID Transaction: ${idTx}`, 40, 255);
+
+    // Référence courte en bas
+    ctx.fillStyle = '#888888';
+    ctx.font = '11px sans-serif';
+    ctx.fillText(`Ref: ${ref}`, 40, 295);
+
+    // Status SUCCESS badge en bas à droite
+    ctx.fillStyle = '#e8f5e9';
+    roundRect(ctx, W-150, 280, 110, 30, 6, true, false);
+    ctx.fillStyle = '#2e7d32';
+    ctx.font = 'bold 12px sans-serif';
+    ctx.fillText('OK  SUCCESS', W-138, 297);
+
+    // Bande latérale colorée selon le network
+    ctx.fillStyle = colors.bg;
+    ctx.fillRect(20, 20, 6, H-40);
+
+    const buffer = canvas.toBuffer('image/png');
+    addLog('info', `  🎨 PNG généré avec données réelles (${buffer.length} bytes)`);
+    return { buffer, mimeType: 'image/png', filename: 'image.png' };
+
+  } catch(e) {
+    addLog('warn', `  Canvas indispo (${e.message}) — fallback PNG basique`);
+    return generateBasicPng(phone, amount, idTx, dateFmt, network);
+  }
+}
+
+// Helper pour rectangles arrondis
+function roundRect(ctx, x, y, w, h, r, fill, stroke) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+  if (fill) ctx.fill();
+  if (stroke) ctx.stroke();
+}
+
+// Fallback PNG sans canvas (si la lib n'est pas dispo)
+function generateBasicPng(phone, amount, idTx, dateFmt, network) {
+  const minimalPng = Buffer.from([
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+    0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE,
+    0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54,
+    0x08, 0x99, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00,
+    0x00, 0x03, 0x00, 0x01, 0x5B, 0x88, 0xC0, 0xC4,
+    0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44,
+    0xAE, 0x42, 0x60, 0x82
+  ]);
+  return { buffer: minimalPng, mimeType: 'image/png', filename: 'image.png' };
+}
+
+// ── Confirmation avec fichier ─────────────────────────────────
+async function confirmWithFile(item, fileBuffer, mimeType, filename) {
+  const cd = item.confirmData;
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+
+  // Pre-call obligatoire (récupère les banks du subagent — comme le navigateur)
+  await fetch('https://my-managment.com/admin/banktransfer/getallbanksbysubagentid', {
+    method:'POST', headers:mgmtH(),
+    body:JSON.stringify({id:cd.subagent_id, ref_id:cd.ref_id||1}),
+  }).catch(()=>{});
+  await sleep(400);
+
+  // Écrire le fichier temporaire avec un nom UNIQUE (évite collisions entre cycles)
+  const uniqueName = `confirm_${Date.now()}_${Math.random().toString(36).substring(2,8)}.png`;
+  const tmpFile = path.join(os.tmpdir(), uniqueName);
+
+  // Écriture synchrone + ouverture/fermeture explicite pour garantir le flush sur disque
+  const fd_write = fs.openSync(tmpFile, 'w');
+  fs.writeSync(fd_write, fileBuffer, 0, fileBuffer.length, 0);
+  fs.fsyncSync(fd_write);  // force le flush physique
+  fs.closeSync(fd_write);
+
+  // Vérifier que le fichier est bien écrit
+  const stat = fs.statSync(tmpFile);
+  addLog('info', `  📁 Fichier temp prêt: ${uniqueName} (${stat.size} bytes)`);
+
+  if (stat.size === 0) {
+    return { ok:false, err:'Fichier temporaire vide après écriture' };
+  }
+
+  let result;
+  try {
+    const fd = new FormData();
+    fd.append('code'        , cd.code||'epay');
+    fd.append('id'          , String(cd.id));
+    fd.append('comment'     , '');
+    fd.append('commentId'   , 'null');
+    fd.append('otherComment', '');
+    fd.append('is_out'      , 'true');
+    fd.append('subagent_id' , String(cd.subagent_id));
+    fd.append('ref_id'      , String(cd.ref_id||1));
+    fd.append('bank_id'     , cd.bank_id ? String(cd.bank_id) : 'null');
+    fd.append('report_id'   , cfg.reportId);
+    fd.append('user_id'     , String(cd.user_id||''));
+
+    // FIX DÉFINITIF: le nom du champ fichier est "approve_doc" (capturé via DevTools sur la vraie requête)
+    fd.append('approve_doc', fs.createReadStream(tmpFile), {
+      filename    : 'image.png',
+      contentType : mimeType || 'image/png',
+    });
+
+    const h = {
+      'Accept'          : 'application/json, text/plain, */*',
+      'X-Requested-With': 'XMLHttpRequest',
+      'X-Time-Zone'     : 'GMT+00',
+      'Cookie'          : getCookieStr(),
+      'User-Agent'      : 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+      'Referer'         : 'https://my-managment.com/fr/admin/report/pendingrequestwithdrawal',
+      'Origin'          : 'https://my-managment.com',
+      ...fd.getHeaders(),
+    };
+
+    const res = await fetch('https://my-managment.com/admin/banktransfer/approvemoney', {
+      method:'POST', headers:h, body:fd,
+    });
+
+    if (res.status===200||res.status===302) {
+      const text = await res.text();
+      // Log la réponse pour debug (premiers 200 chars)
+      addLog('info', `  🔍 Réponse confirm [${res.status}]: ${text.substring(0,200).replace(/\n/g,' ')}`);
+      // Réponse HTML = succès (redirection)
+      if (text.startsWith('<')||text.includes('<!DOCTYPE')) {
+        result = { ok:true };
+      } else {
+        try {
+          const json = JSON.parse(text);
+          // Vérifier explicitement le message d'erreur "photo confirmation"
+          const msg = json.message || JSON.stringify(json);
+          if (msg && msg.toLowerCase().includes('photo confirmation')) {
+            result = { ok:false, err:`Photo refusée par le serveur: ${msg.substring(0,120)}` };
+          } else {
+            result = { ok:json.success===true, err:msg.substring(0,120) };
+          }
+        } catch(e) {
+          result = { ok:true };
+        }
+      }
+    } else {
+      const errText = await res.text().catch(()=>'');
+      addLog('warn', `  🔍 HTTP ${res.status}: ${errText.substring(0,200).replace(/\n/g,' ')}`);
+      result = { ok:false, err:`HTTP ${res.status} — ${errText.substring(0,80)}` };
+    }
+  } finally {
+    // Nettoyer le fichier temporaire
+    try { fs.unlinkSync(tmpFile); } catch(e) {}
+  }
+
+  return result;
+}
+
+// ── Confirmation SANS fichier (fallback) ──────────────────────
+async function confirmWithoutFile(item) {
+  const cd = item.confirmData;
+  await fetch('https://my-managment.com/admin/banktransfer/getallbanksbysubagentid', {
+    method:'POST', headers:mgmtH(),
+    body:JSON.stringify({id:cd.subagent_id, ref_id:cd.ref_id||1}),
+  }).catch(()=>{});
+  await sleep(400);
+
+  const fd = new FormData();
+  fd.append('code'        , cd.code||'epay');
+  fd.append('id'          , String(cd.id));
+  fd.append('comment'     , '');
+  fd.append('commentId'   , 'null');
+  fd.append('otherComment', '');
+  fd.append('is_out'      , 'true');
+  fd.append('subagent_id' , String(cd.subagent_id));
+  fd.append('ref_id'      , String(cd.ref_id||1));
+  fd.append('bank_id'     , cd.bank_id ? String(cd.bank_id) : 'null');
+  fd.append('report_id'   , cfg.reportId);
+  fd.append('user_id'     , String(cd.user_id||''));
+  const h = {
+    'Accept':'application/json, text/plain, */*','X-Requested-With':'XMLHttpRequest',
+    'X-Time-Zone':'GMT+00','Cookie':getCookieStr(),
+    'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+    'Referer':'https://my-managment.com/fr/admin/report/pendingrequestwithdrawal',
+    ...fd.getHeaders(),
+  };
+  const res = await fetch('https://my-managment.com/admin/banktransfer/approvemoney', {
+    method:'POST', headers:h, body:fd,
+  });
+  if (res.status===200||res.status===302) {
+    const text = await res.text();
+    if (text.startsWith('<')||text.includes('<!DOCTYPE')) return { ok:true };
+    try { const j=JSON.parse(text); return {ok:j.success===true,err:j.message||''}; }
+    catch(e) { return {ok:true}; }
+  }
+  const errText = await res.text().catch(()=>'');
+  return { ok:false, err:`HTTP ${res.status} — ${errText.substring(0,80)}` };
+}
+
+function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
+
+// ── Cycle principal ───────────────────────────────────────────
+async function runCycle() {
+  if (isRunning) return;
+  isRunning = true; stats.polls++;
+  addLog('info', `━━ Poll #${stats.polls} ━━`);
+  try {
+    if (!getCookieStr()) throw new Error('Cookies manquants — injecter via le dashboard');
+    if (!cfg.yapsonToken) throw new Error('YAPSON_TOKEN manquant');
+
+    const groups = await getAllWithdrawals();
+    const groupList = Object.values(groups);
+
+    if (!groupList.length) {
+      addLog('info', 'Poll: 0 retrait en attente');
+      isRunning = false; return;
+    }
+
+    addLog('info', `${groupList.length} fournisseur(s) — ${groupList.map(g=>`${g.subagentName.substring(0,20)}(${g.items.length})`).join(', ')}`);
+
+    // Traiter fournisseur par fournisseur
+    // Bot7-H : flag de sortie précoce — on ne traite qu'1 SEUL retrait par cycle
+    let processed = false;
+
+    for (const group of groupList) {
+      if (processed) break;  // Bot7-H : sortir dès qu'un retrait a été traité
+      const { subagentName, network, filesRequired, items } = group;
+      addLog('info', `▶ Fournisseur: ${subagentName} | Réseau: ${network} | ${items.length} retrait(s) en attente`);
+
+      for (const item of items) {
+        if (processed) break;  // Bot7-H : sortir dès qu'un retrait a été traité
+
+        addLog('info', `  → ${item.phone} — ${item.montant.toLocaleString()} FCFA [${network}]`);
+
+        // 1. Décaisser
+        const payResult = await payout(item, network);
+        if (!payResult.ok) {
+          stats.missing++;
+          addLog('err', `  ✘ Décaissement échoué: ${item.phone} — ${payResult.err}`);
+          processed = true;  // Bot7-H : un échec compte comme un cycle utilisé
+          break;
+        }
+        addLog('ok', `  ✔ Décaissé: ${item.phone} → ${item.montant.toLocaleString()} FCFA (uid: ${payResult.uid?.substring(0,8)}...)`);
+
+        // 2. Bot7-H : confirmation SANS fichier, peu importe ce que dit filesRequired
+        // On attend juste un peu après le décaissement pour laisser yapson finaliser
+        await sleep(2000);
+        const confirmResult = await confirmWithoutFile(item);
+        if (confirmResult.ok) {
+          stats.confirmed++;
+          addLog('ok', `  ✔ Confirmé sans fichier: ${item.phone}`);
+        } else {
+          stats.missing++;
+          addLog('warn', `  ⚠ Confirmation échouée: ${item.phone} — ${confirmResult.err}`);
+        }
+
+        processed = true;  // Bot7-H : on a traité 1 retrait, on s'arrête
+        addLog('info', `  ⏸ Bot7-H : pause de 10 minutes avant le prochain retrait`);
+      }
+    }
+
+    if (!processed) {
+      addLog('info', `Aucun retrait en attente — prochain check dans ${cfg.pollInterval}s`);
+    } else {
+      addLog('info', `Cycle terminé — 1 retrait traité, prochain dans ${cfg.pollInterval}s`);
+    }
+  } catch(e) {
+    addLog('err', `Erreur: ${e.message}`); stats.rejected++;
+  } finally { isRunning = false; }
+}
+
+function startPolling() {
+  if (pollTimer) return; botActive = true;
+  addLog('ok', `Bot démarré — ${cfg.pollInterval}s`);
+  runCycle(); pollTimer = setInterval(runCycle, cfg.pollInterval*1000);
+}
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  botActive = false; addLog('warn', 'Bot arrêté');
+}
+
+// ── Dashboard ─────────────────────────────────────────────────
+app.get('/', (req,res) => {
+  const logHtml = logs.slice(0,120).map(e => {
+    const cls = e.type==='ok'?'ok':e.type==='err'?'er':e.type==='warn'?'wa':e.type==='dot'?'dt':'in';
+    const ic  = e.type==='ok'?'✔':e.type==='err'?'✘':e.type==='warn'?'⚠':e.type==='dot'?'◉':'▸';
+    return `<div class="le ${cls}"><span class="lt">${e.ts}</span><span>${ic} ${e.msg}</span></div>`;
+  }).join('');
+  const hasSession = getCookieStr().length > 20;
+  const cookieAlert = !hasSession ? `<div class="alert-box">
+    <div class="alert-title">🍪 Cookies my-managment requis</div>
+    <div class="alert-body">my-managment utilise un reCAPTCHA — connexion auto impossible.<br>
+    <strong>Comment obtenir tes cookies :</strong><br>
+    1. Connecte-toi sur my-managment.com dans ton navigateur<br>
+    2. F12 → Application → Cookies → my-managment.com<br>
+    3. Clic droit → Copy all as JSON<br>
+    4. Colle ci-dessous et clique Injecter</div>
+    <form method="POST" action="/inject-cookies">
+      <textarea name="cookies" placeholder='[{"name":"auid","value":"..."},{"name":"PHPSESSID","value":"..."}]'></textarea>
+      <button class="btn btn-inject" type="submit">🍪 Injecter les cookies</button>
+    </form></div>` : '';
+
+  res.send(`<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>YapsonBot7-H</title><meta http-equiv="refresh" content="15">
+<style>
+:root{--bg:#0d1117;--s1:#161b22;--s2:#21262d;--s3:#30363d;--t:#e6edf3;--m:#8b949e;--g:#3fb950;--b:#58a6ff;--o:#f0883e;--r:#f85149;--p:#bc8cff;}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);font-family:'Courier New',monospace;color:var(--t);font-size:13px;padding:20px}
+.wrap{max-width:960px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+.alert-box{background:#1a1040;border:2px solid #6c3fc5;border-radius:12px;padding:20px}
+.alert-title{font-size:15px;font-weight:700;color:#c79fff;margin-bottom:12px}
+.alert-body{font-size:11px;color:#b8a4e8;line-height:2;margin-bottom:14px}
+.alert-body strong{color:var(--t)}
+.alert-box textarea{width:100%;height:80px;background:#0d0820;border:1px solid #6c3fc5;color:#c79fff;border-radius:7px;padding:10px;font-family:inherit;font-size:10px;outline:none;resize:vertical}
+.statbar{display:flex;gap:8px;flex-wrap:wrap}
+.sc{background:var(--s1);border:1px solid var(--s3);border-radius:10px;padding:12px 20px;min-width:90px;text-align:center;flex:1}
+.sv{font-size:28px;font-weight:700;line-height:1}.sl{font-size:9px;color:var(--m);text-transform:uppercase;letter-spacing:1px;margin-top:4px}
+.sc.vc .sv{color:var(--g)}.sc.vm .sv{color:var(--o)}.sc.vf .sv{color:var(--b)}.sc.vp .sv{color:var(--p)}.sc.vs .sv{color:var(--t)}.sc.vr .sv{color:var(--r)}
+.card{background:var(--s1);border:1px solid var(--s3);border-radius:10px;overflow:hidden}
+.ch{padding:12px 16px;border-bottom:1px solid var(--s3);font-size:10px;font-weight:700;letter-spacing:2px;color:var(--m);text-transform:uppercase;display:flex;align-items:center;gap:8px}
+.cb{padding:16px}.g2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:600px){.g2{grid-template-columns:1fr}}
+.frow{display:flex;flex-direction:column;gap:5px;margin-bottom:12px}
+label{font-size:9px;font-weight:700;letter-spacing:1.5px;color:var(--m);text-transform:uppercase}
+input,select,textarea{width:100%;background:var(--s2);border:1px solid var(--s3);color:var(--t);border-radius:6px;padding:8px 10px;font-family:inherit;font-size:12px;outline:none}
+input:focus,select:focus,textarea:focus{border-color:var(--b)}
+.inline{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.il{font-size:11px;color:var(--m)}
+.btn{padding:9px 18px;border-radius:7px;font-family:inherit;font-size:11px;font-weight:700;cursor:pointer;border:none;text-decoration:none;display:inline-block}
+.btn-save{background:rgba(88,166,255,.15);color:var(--b);border:1px solid rgba(88,166,255,.4)}
+.btn-go{background:rgba(63,185,80,.2);color:var(--g);border:1px solid rgba(63,185,80,.4)}
+.btn-stop{background:rgba(248,81,73,.15);color:var(--r);border:1px solid rgba(248,81,73,.35)}
+.btn-gray{background:var(--s2);color:var(--m);border:1px solid var(--s3)}
+.btn-inject{background:#6c3fc5;color:#fff;border:none;padding:10px 20px;font-size:12px;margin-top:10px}
+.btn:hover{filter:brightness(1.15)}.btns{display:flex;gap:8px;flex-wrap:wrap}
+.badge{display:inline-flex;align-items:center;gap:5px;border-radius:20px;padding:4px 12px;font-size:10px;font-weight:700}
+.badge .dot{width:7px;height:7px;border-radius:50%}
+.b-on{background:rgba(63,185,80,.15);color:var(--g);border:1px solid rgba(63,185,80,.3)}
+.b-on .dot{background:var(--g);animation:pulse 1.8s infinite}
+.b-off{background:rgba(139,148,158,.1);color:var(--m);border:1px solid rgba(139,148,158,.2)}
+.b-off .dot{background:var(--m)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.log{background:#0d1117;border-radius:7px;max-height:450px;overflow-y:auto;padding:8px;font-size:10px;line-height:1.9;word-break:break-word}
+.le{display:flex;gap:10px}.lt{color:var(--m);min-width:135px;flex-shrink:0}
+.ok span:last-child{color:var(--g)}.er span:last-child{color:var(--r)}.wa span:last-child{color:var(--o)}.dt span:last-child{color:var(--m)}.in span:last-child{color:var(--b)}
+.hint{border-radius:7px;padding:8px 12px;font-size:10px;line-height:1.8;margin-top:8px}
+.hint-g{background:rgba(63,185,80,.08);border:1px solid rgba(63,185,80,.2);color:var(--g)}
+.hint-w{background:rgba(240,136,62,.08);border:1px solid rgba(240,136,62,.2);color:var(--o)}.hint b{color:var(--t)}
+.seclbl{font-size:11px;font-weight:700;margin-bottom:10px}
+.tag-ok{display:inline-block;background:rgba(63,185,80,.15);color:var(--g);border:1px solid rgba(63,185,80,.3);border-radius:4px;padding:1px 7px;font-size:9px;margin-left:6px}
+.tag-err{display:inline-block;background:rgba(248,81,73,.15);color:var(--r);border:1px solid rgba(248,81,73,.3);border-radius:4px;padding:1px 7px;font-size:9px;margin-left:6px}
+.net-badge{display:inline-block;border-radius:4px;padding:2px 8px;font-size:10px;font-weight:700;margin:2px}
+.net-wave{background:rgba(188,140,255,.15);color:var(--p);border:1px solid rgba(188,140,255,.3)}
+.net-orange{background:rgba(240,136,62,.15);color:var(--o);border:1px solid rgba(240,136,62,.3)}
+.net-mtn{background:rgba(255,215,0,.1);color:#ffd700;border:1px solid rgba(255,215,0,.3)}
+.net-moov{background:rgba(88,166,255,.15);color:var(--b);border:1px solid rgba(88,166,255,.3)}
+</style></head><body><div class="wrap">
+
+${cookieAlert}
+
+<div class="statbar">
+<div class="sc vc"><div class="sv">${stats.confirmed}</div><div class="sl">Confirmés</div></div>
+<div class="sc vm"><div class="sv">${stats.missing}</div><div class="sl">Manquants</div></div>
+<div class="sc vf"><div class="sv">${stats.fixed}</div><div class="sl">Corrigés</div></div>
+<div class="sc vp"><div class="sv">${stats.polls}</div><div class="sl">Polls</div></div>
+<div class="sc vs"><div class="sv">0</div><div class="sl">SMS</div></div>
+<div class="sc vr"><div class="sv">${stats.rejected}</div><div class="sl">Rejetés</div></div>
+</div>
+
+<div class="card"><div class="ch"><span>🔑</span> COMPTES</div><div class="cb">
+<form method="POST" action="/save-accounts"><div class="g2">
+<div><div class="seclbl" style="color:var(--b)">agg.yapson.net</div>
+<div class="frow"><label>Token yapson</label>
+<input type="password" name="yapsonToken" value="${cfg.yapsonToken?'●'.repeat(20):''}" placeholder="eyJhbGci...">
+${cfg.yapsonToken?'<span class="tag-ok">✓ OK</span>':'<span class="tag-err">✗ manquant</span>'}
+</div></div>
+<div><div class="seclbl" style="color:var(--g)">my-managment.com</div>
+<div class="frow"><label>Cookies de session</label>
+<textarea name="mgmtCookies" rows="3" placeholder='${cfg.mgmtCookies?"Cookies déjà configurés ✓ — coller ici pour remplacer":"[{\"name\":\"auid\",...}] ou PHPSESSID=...; auid=..."}'></textarea>
+${hasSession?'<span class="tag-ok">✓ Session active</span>':'<span class="tag-err">✗ Requis</span>'}
+</div>
+<div class="hint ${hasSession?'hint-g':'hint-w'}" style="font-size:9px">${hasSession?'✔ Session active — expire ~12h':'⚠ Coller JSON Firefox ou PHPSESSID=...; auid=...'}</div>
+</div></div>
+<div style="margin-top:14px"><button class="btn btn-save" type="submit">💾 Sauvegarder</button></div>
+</form></div></div>
+
+<div class="card"><div class="ch"><span>⚙️</span> CONFIGURATION</div><div class="cb">
+<form method="POST" action="/save-config">
+<div class="frow"><div class="inline">
+<span class="il">Intervalle :</span><input type="number" name="pollInterval" value="${cfg.pollInterval}" min="60" max="86400" style="width:90px"><span class="il">s</span>
+<span class="il" style="margin-left:16px">Solde max :</span><input type="number" name="maxSolde" value="${cfg.maxSolde}" min="0" style="width:120px"><span class="il">FCFA (0 = illimité)</span>
+</div></div>
+<div class="frow" style="margin-top:8px">
+<div style="font-size:10px;color:var(--m)">Réseaux auto-détectés via le titre my-managment :</div>
+<div style="margin-top:6px">
+<span class="net-badge net-wave">Wave → Wave</span>
+<span class="net-badge net-orange">Orange → Orangeint</span>
+<span class="net-badge net-mtn">MTN → MTN CI</span>
+<span class="net-badge net-moov">Moov → MOOV CI</span>
+</div>
+</div>
+<div style="margin-top:14px"><button class="btn btn-save" type="submit">💾 Appliquer</button></div>
+</form></div></div>
+
+<div class="card"><div class="ch"><span>▶</span> CONTRÔLES</div><div class="cb">
+<span class="${botActive?'badge b-on':'badge b-off'}"><span class="dot"></span>${botActive?'Actif — toutes les '+cfg.pollInterval+'s':'Arrêté'}</span>
+<div class="btns" style="margin-top:14px">
+<a class="btn ${botActive?'btn-gray':'btn-go'}" href="/start">▶ Démarrer</a>
+<a class="btn ${botActive?'btn-stop':'btn-gray'}" href="/stop">■ Arrêter</a>
+<a class="btn btn-gray" href="/run">↻ Lancer cycle</a>
+<a class="btn btn-gray" href="/reset">◌ Reset stats</a>
+<a class="btn btn-gray" href="/">⟳ Actualiser</a>
+</div></div></div>
+
+<div class="card"><div class="ch"><span>📋</span> JOURNAL — ${logs.length} entrées</div>
+<div class="cb" style="padding:8px"><div class="log">${logHtml||'<div class="le in"><span class="lt">—</span><span>▸ En attente</span></div>'}</div>
+</div></div>
+</div></body></html>`);
+});
+
+app.post('/inject-cookies',(req,res) => {
+  const raw = (req.body.cookies||'').trim();
+  if (!raw) { res.redirect('/'); return; }
+  // Validation stricte
+  const looksValid = raw.startsWith('[') || /^[a-zA-Z_][a-zA-Z0-9_]*=/.test(raw);
+  const isPolluted = raw.includes('configuré') || raw.includes('(coller') || raw.startsWith('(');
+  if (!looksValid || isPolluted) {
+    addLog('warn', `⚠ Cookies rejetés — efface complètement le textarea avant de coller`);
+    res.redirect('/');
+    return;
+  }
+  cfg.mgmtCookies = raw;
+  addLog('ok',`🍪 Cookies injectés — ${parseCookies(cfg.mgmtCookies).split(';').length} cookie(s)`);
+  if(!botActive&&cfg.yapsonToken) startPolling();
+  res.redirect('/');
+});
+app.post('/save-accounts',(req,res) => {
+  const{yapsonToken,mgmtCookies}=req.body;
+  if(yapsonToken&&!yapsonToken.startsWith('●'))cfg.yapsonToken=yapsonToken.trim();
+  // Validation stricte: rejeter toute valeur polluée (placeholder, parenthèses, etc.)
+  if (mgmtCookies) {
+    const trimmed = mgmtCookies.trim();
+    const looksValid = trimmed.startsWith('[') || /^[a-zA-Z_][a-zA-Z0-9_]*=/.test(trimmed);
+    const isPolluted = trimmed.includes('configuré') || trimmed.includes('(coller') || trimmed.startsWith('(');
+    if (looksValid && !isPolluted) {
+      cfg.mgmtCookies = trimmed;
+      addLog('ok', `🍪 Cookies mis à jour — ${parseCookies(cfg.mgmtCookies).split(';').length} cookie(s)`);
+    } else if (isPolluted) {
+      addLog('warn', `⚠ Cookies ignorés (placeholder détecté) — efface le textarea avant de coller`);
+    } else if (trimmed.length > 0) {
+      addLog('warn', `⚠ Cookies ignorés (format invalide) — attendu: JSON [{name,value}] ou PHPSESSID=...; auid=...`);
+    }
+  }
+  addLog('ok',`Comptes mis à jour`);
+  if(botActive){stopPolling();setTimeout(startPolling,500);}
+  res.redirect('/');
+});
+app.post('/save-config',(req,res) => {
+  const{pollInterval,maxSolde}=req.body;
+  if(pollInterval)cfg.pollInterval=Math.max(60,parseInt(pollInterval));
+  if(maxSolde!==undefined)cfg.maxSolde=parseInt(maxSolde)||0;
+  addLog('ok',`Config: intervalle=${cfg.pollInterval}s`);
+  if(botActive){stopPolling();setTimeout(startPolling,500);}
+  res.redirect('/');
+});
+app.get('/start', (req,res)=>{startPolling();res.redirect('/');});
+app.get('/stop',  (req,res)=>{stopPolling(); res.redirect('/');});
+app.get('/run',   async(req,res)=>{runCycle().catch(e=>addLog('err',e.message));res.redirect('/');});
+app.get('/reset', (req,res)=>{Object.keys(stats).forEach(k=>stats[k]=0);logs.length=0;addLog('info','Reset');res.redirect('/');});
+app.get('/health',(req,res)=>res.json({...stats,botActive,interval:cfg.pollInterval,hasSession:getCookieStr().length>20}));
+app.get('/cookies',(req,res)=>res.redirect('/'));
+
+app.listen(PORT, () => {
+  addLog('info', `YapsonBot7-H démarré — port ${PORT}`);
+  addLog('info', `Intervalle: ${cfg.pollInterval}s | report_id: ${cfg.reportId}`);
+  const p = parseCookies(cfg.mgmtCookies);
+  if(p && cfg.yapsonToken) {
+    addLog('info', `Cookies: ${p.split(';').length} ok | Token: OK`);
+    startPolling();
+  } else {
+    addLog('warn','Configurer cookies + token dans le dashboard');
+  }
+});
