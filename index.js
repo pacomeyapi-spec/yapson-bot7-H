@@ -1,7 +1,10 @@
 'use strict';
 // ============================================================
-// yapson-bot7-h — Multi-utilisateurs
-// Sans capture, 1 retrait par cycle (10min entre chaque)
+// yapson-bot7-H-CP — Multi-utilisateurs
+// Décaissement via app.connectpro.yapson.net (ConnectPro)
+// Confirmation via my-managment.com (inchangé)
+// 1 SEUL retrait par cycle — sans capture d'écran
+// Polling status="success" max 2min avant confirmation
 // ============================================================
 
 const express  = require('express');
@@ -44,11 +47,11 @@ function createUser(username, password) {
     id, username,
     passwordHash: hashPass(password),
     cfg: {
-      mgmtCookies : '',
-      yapsonToken : '',
-      reportId    : process.env.REPORT_ID || '8231c3be3216307da83c067d263c09ec',
-      pollInterval: parseInt(process.env.POLL_INTERVAL || '600'),
-      maxSolde    : parseInt(process.env.MAX_SOLDE || '0'),
+      mgmtCookies    : '',
+      connectproToken: '',   // JWT accessToken de app.connectpro.yapson.net
+      reportId       : process.env.REPORT_ID || '8231c3be3216307da83c067d263c09ec',
+      pollInterval   : parseInt(process.env.POLL_INTERVAL || '600'),
+      maxSolde       : parseInt(process.env.MAX_SOLDE || '0'),
     },
     stats: { confirmed:0, missing:0, fixed:0, polls:0, rejected:0 },
     logs: [],
@@ -64,7 +67,7 @@ function ulog(u, type, msg) {
   console.log(`[${u.username}][${type.toUpperCase()}] ${ts} — ${msg}`);
 }
 
-// ── Mapping réseau ────────────────────────────────────────────
+// ── Mapping réseau (UUIDs ConnectPro) ────────────────────────
 const NET_UUIDS = {
   'MOOV CI'  : '24462fd9-c8e2-42f2-a95f-119844bc2ada',
   'MTN CI'   : '77e8e729-a0f1-4e1b-8614-168c77f4b101',
@@ -81,6 +84,7 @@ function detectNetwork(title) {
   return 'Orangeint';
 }
 
+// ── Utilitaires ───────────────────────────────────────────────
 function parseCookies(raw) {
   if (!raw) return '';
   let s = raw.trim().replace(/^\([^)]*\)\s*/,'').replace(/^[^[a-zA-Z]+/,'').trim();
@@ -106,12 +110,18 @@ function mgmtH(u) {
     'Referer'          : 'https://my-managment.com/fr/admin/report/pendingrequestwithdrawal',
   };
 }
-function yapH(u) {
-  return { 'Content-Type':'application/json', 'Authorization': `Bearer ${u.cfg.yapsonToken}` };
+
+// Headers ConnectPro (JWT Bearer)
+function cpH(u) {
+  return {
+    'Content-Type' : 'application/json',
+    'Authorization': `Bearer ${u.cfg.connectproToken}`,
+  };
 }
+
 function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
 
-// ── Lire tous les retraits ────────────────────────────────────
+// ── Lire tous les retraits (my-managment) ────────────────────
 async function getAllWithdrawals(u) {
   const res = await fetch('https://my-managment.com/admin/report/pendingrequestwithdrawal', {
     method:'POST', headers:mgmtH(u), body:JSON.stringify({page:1,limit:500}),
@@ -128,31 +138,92 @@ async function getAllWithdrawals(u) {
     const pm      = String(phone).match(/0[0-9]{9}/);
     const cd      = row.confirm?.[0]?.data || null;
     const sid     = cd?.subagent_id;
-    const filesRequired = cd?.files_required || 0;
-    const subagentName  = row.subagent || `Fournisseur_${sid}`;
+    const subagentName = row.subagent || `Fournisseur_${sid}`;
     if (!pm || montant <= 0 || !cd || !sid) continue;
-    if (!groups[sid]) groups[sid] = { subagent_id:sid, subagentName, netTitle, network:detectNetwork(netTitle), filesRequired, items:[] };
+    if (!groups[sid]) groups[sid] = { subagent_id:sid, subagentName, netTitle, network:detectNetwork(netTitle), items:[] };
     groups[sid].items.push({ phone:pm[0], montant, confirmData:cd, netTitle });
   }
   return groups;
 }
 
-// ── Décaissement ──────────────────────────────────────────────
+// ── Décaissement ConnectPro ───────────────────────────────────
+// POST https://connect.yapson.net/api/payments/user/transactions/
+// Body: {"type":"deposit","amount":X,"recipient_phone":"0XXXXXXXXX","network":"UUID","objet":null}
+// Réponse: {"success":true,"message":"...","data":{"uid":"xxx-xxx",...}}
 async function payout(u, item, network) {
   const uuid = NET_UUIDS[network] || NET_UUIDS['Orangeint'];
-  const res  = await fetch('https://connect.yapson.net/api/aggregator/payout/', {
-    method:'POST', headers:yapH(u),
-    body:JSON.stringify({ amount:item.montant, recipient_phone:item.phone, network:uuid }),
+  const body = { type:'deposit', amount:item.montant, recipient_phone:item.phone, network:uuid, objet:null };
+  ulog(u, 'info', `  📤 ConnectPro → ${item.phone} — ${item.montant} FCFA [${network}]`);
+  const res = await fetch('https://connect.yapson.net/api/payments/user/transactions/', {
+    method:'POST', headers:cpH(u), body:JSON.stringify(body),
   });
-  const body = await res.json().catch(()=>({}));
-  ulog(u,'info',`  🔍 Payout [${res.status}]: ${JSON.stringify(body).substring(0,120)}`);
-  if (res.status===200||res.status===201) {
-    return { ok:true, uid:body.uid||body.id||body.reference||null, phone:item.phone, montant:item.montant };
+  const respBody = await res.json().catch(()=>({}));
+  ulog(u, 'info', `  🔍 Réponse [${res.status}]: ${JSON.stringify(respBody).substring(0,200)}`);
+  if (res.status === 200 || res.status === 201) {
+    // ConnectPro retourne: {"success":true,"data":{"uid":"xxx","type":"deposit",...}}
+    const d = respBody.data || respBody;
+    const txId = d.uid || d.id || d.reference || null;
+    ulog(u, 'info', `  🆔 txId: ${txId}`);
+    return { ok:true, txId, phone:item.phone, montant:item.montant };
   }
-  return { ok:false, err:JSON.stringify(body).substring(0,100) };
+  if (res.status === 401) return { ok:false, err:'Token ConnectPro expiré', tokenExpired:true };
+  return { ok:false, err:`[${res.status}] ${JSON.stringify(respBody).substring(0,100)}` };
 }
 
-// ── Confirmation sans fichier ─────────────────────────────────
+// ── Attendre status="success" (polling ConnectPro) ────────────
+// GET https://connect.yapson.net/api/payments/user/transactions/{uid}/
+// Champ: tx.status === "success"
+// tx.network est un objet {uid, nom, code, ...}
+async function waitForSuccess(u, txId, phone, maxWait=120000) {
+  const start = Date.now();
+  function normalizePhone(p) {
+    const s = String(p||'').replace(/[^0-9]/g,'');
+    if (s.startsWith('225')) return s.substring(3);
+    return s.length === 10 ? s : s;
+  }
+  const phoneNorm = normalizePhone(phone);
+
+  while (Date.now() - start < maxWait) {
+    await sleep(5000);
+    if (Date.now() - start >= maxWait) break;
+    try {
+      let tx = null;
+      if (txId) {
+        // GET direct par uid — retourne l'objet sans wrapper
+        const res = await fetch(`https://connect.yapson.net/api/payments/user/transactions/${txId}/`, {
+          headers: cpH(u),
+        });
+        if (res.status === 401) { ulog(u, 'err', '  ⚠ Token ConnectPro expiré'); break; }
+        tx = await res.json().catch(()=>null);
+      } else {
+        // Fallback: liste récente, chercher par téléphone
+        const res = await fetch('https://connect.yapson.net/api/payments/user/transactions/?limit=50', {
+          headers: cpH(u),
+        });
+        const raw = await res.json().catch(()=>({}));
+        const list = Array.isArray(raw) ? raw : (raw.data || raw.results || []);
+        tx = list.find(t => normalizePhone(t.recipient_phone||'') === phoneNorm);
+      }
+      if (!tx) { ulog(u, 'info', `  ⏳ Transaction introuvable pour ${phone}... (${Math.round((Date.now()-start)/1000)}s)`); continue; }
+
+      const status = (tx.status||'').toLowerCase().trim();
+      ulog(u, 'info', `  ⏳ ${String(txId||phone).substring(0,10)} status=${status}... (${Math.round((Date.now()-start)/1000)}s)`);
+
+      // API ConnectPro retourne status="success" en anglais minuscule
+      if (status === 'success') return { ok:true, tx };
+      if (status === 'failed' || status === 'rejected' || status === 'cancelled') {
+        return { ok:false, err:`Transaction ${status}: ${tx.error_message||''}`, skip:true };
+      }
+      // Statuts intermédiaires: pending, processing, sent_to_user → continuer à attendre
+
+    } catch(e) {
+      ulog(u, 'info', `  ⏳ attente... (${Math.round((Date.now()-start)/1000)}s)`);
+    }
+  }
+  return { ok:false, err:`Timeout 2min — ${phone} ignoré`, skip:true };
+}
+
+// ── Confirmation sans fichier (my-managment) ─────────────────
 async function confirmWithoutFile(u, item) {
   const cd = item.confirmData;
   await fetch('https://my-managment.com/admin/banktransfer/getallbanksbysubagentid', {
@@ -189,12 +260,11 @@ async function runCycle(u) {
   u.isRunning = true; u.stats.polls++;
   ulog(u,'info',`━━ Poll #${u.stats.polls} ━━`);
   try {
-    if (!parseCookies(u.cfg.mgmtCookies)) throw new Error('Cookies manquants');
-    if (!u.cfg.yapsonToken) throw new Error('Token yapson manquant');
+    if (!parseCookies(u.cfg.mgmtCookies)) throw new Error('Cookies my-managment manquants');
+    if (!u.cfg.connectproToken)           throw new Error('Token ConnectPro manquant');
 
-    const groups = await getAllWithdrawals(u);
+    const groups    = await getAllWithdrawals(u);
     const groupList = Object.values(groups);
-
     if (!groupList.length) { ulog(u,'info','0 retrait en attente'); u.isRunning=false; return; }
     ulog(u,'info',`${groupList.length} fournisseur(s) — ${groupList.map(g=>`${g.subagentName.substring(0,20)}(${g.items.length})`).join(', ')}`);
 
@@ -204,19 +274,37 @@ async function runCycle(u) {
       if (processed) break;
       const { subagentName, network, items } = group;
       ulog(u,'info',`▶ ${subagentName} | ${network} | ${items.length} retrait(s)`);
+
       for (const item of items) {
         if (processed) break;
         ulog(u,'info',`  → ${item.phone} — ${item.montant.toLocaleString()} FCFA [${network}]`);
 
+        // 1. Décaisser via ConnectPro
         const payResult = await payout(u, item, network);
         if (!payResult.ok) {
           u.stats.missing++;
           ulog(u,'err',`  ✘ Décaissement échoué: ${item.phone} — ${payResult.err}`);
+          if (payResult.tokenExpired) {
+            ulog(u,'err','  🔑 Token ConnectPro expiré — arrêt du cycle');
+            u.isRunning = false; return;
+          }
           processed = true; break;
         }
-        ulog(u,'ok',`  ✔ Décaissé: ${item.phone} → ${item.montant.toLocaleString()} FCFA`);
+        ulog(u,'ok',`  ✔ Décaissé: ${item.phone} → ${item.montant.toLocaleString()} FCFA (uid: ${String(payResult.txId||'?').substring(0,10)})`);
 
-        await sleep(2000);
+        // 2. Attendre status="success" (max 2min)
+        ulog(u,'info',`  ⏳ Attente status=success pour ${item.phone} (max 2min)...`);
+        const waitResult = await waitForSuccess(u, payResult.txId, item.phone, 120000);
+
+        if (!waitResult.ok) {
+          u.stats.missing++;
+          ulog(u,'warn',`  ⚠ ${waitResult.err}`);
+          processed = true; break;
+        }
+        ulog(u,'ok',`  ✔ Transaction SUCCESS: ${String(waitResult.tx?.uid||waitResult.tx?.id||'?').substring(0,10)}`);
+
+        // 3. Confirmer sur my-managment
+        await sleep(500);
         const confirmResult = await confirmWithoutFile(u, item);
         if (confirmResult.ok) {
           u.stats.confirmed++;
@@ -288,14 +376,15 @@ input:focus,select:focus,textarea:focus{border-color:var(--b)}
 .tbl th{background:var(--s2);padding:7px;text-align:left;color:var(--b)}
 .tbl td{padding:6px 7px;border-bottom:1px solid var(--s3)}
 .seclbl{font-size:11px;font-weight:700;margin-bottom:10px}
+.info-box{background:rgba(88,166,255,.07);border:1px solid rgba(88,166,255,.2);border-radius:8px;padding:10px 14px;font-size:10px;color:var(--b);margin-bottom:10px;line-height:1.8}
 `;
 
 // ── Pages HTML ────────────────────────────────────────────────
 function loginPage(err='') {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Bot7-H</title>
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Bot7-H-CP</title>
 <style>${CSS}.box{max-width:380px;margin:80px auto;background:var(--s1);border:1px solid var(--s3);border-radius:12px;padding:28px}
 h1{color:var(--p);font-size:1.2rem;margin-bottom:20px;text-align:center}</style></head>
-<body><div class="box"><h1>🤖 YapsonBot7-H</h1>
+<body><div class="box"><h1>🤖 YapsonBot7-H-CP</h1>
 ${err?`<div style="color:var(--r);font-size:11px;margin-bottom:10px">✘ ${err}</div>`:''}
 <form method="POST" action="/login">
 <div class="frow"><label>Utilisateur</label><input type="text" name="username" required></div>
@@ -311,12 +400,12 @@ function userPage(u) {
     return `<div class="le ${cls}"><span class="lt">${e.ts}</span><span>${ic} ${e.msg}</span></div>`;
   }).join('');
   const hasSession = parseCookies(u.cfg.mgmtCookies).length > 20;
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Bot7-H — ${u.username}</title>
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Bot7-H-CP — ${u.username}</title>
 <style>${CSS}</style>
 <script>if(${JSON.stringify(u.botActive)}) setTimeout(()=>location.reload(),15000);</script>
 </head><body><div class="wrap">
 <div style="display:flex;justify-content:space-between;align-items:center">
-  <div style="color:var(--p);font-weight:700;font-size:1.1rem">🤖 ${u.username} <span style="font-size:10px;color:var(--m)">Bot7-H — 1 retrait/cycle</span></div>
+  <div style="color:var(--p);font-weight:700;font-size:1.1rem">🤖 ${u.username} <span style="font-size:10px;color:var(--m)">Bot7-H-CP — 1 retrait/cycle</span></div>
   <a href="/logout" class="btn btn-gray" style="font-size:10px">Déconnexion</a>
 </div>
 <div class="statbar">
@@ -326,11 +415,15 @@ function userPage(u) {
 <div class="sc vr"><div class="sv">${u.stats.rejected}</div><div class="sl">Rejetés</div></div>
 </div>
 <div class="card"><div class="ch">🔑 COMPTES</div><div class="cb">
+<div class="info-box">
+  <strong>ConnectPro</strong> — Récupérer le token sur <code>app.connectpro.yapson.net</code> :<br>
+  F12 → Application → LocalStorage → copier <strong>accessToken</strong>
+</div>
 <form method="POST" action="/user/save-accounts"><div class="g2">
-<div><div class="seclbl" style="color:var(--b)">agg.yapson.net</div>
-<div class="frow"><label>Token Yapson</label>
-<input type="password" name="yapsonToken" value="${u.cfg.yapsonToken?'●'.repeat(20):''}" placeholder="eyJhbGci...">
-${u.cfg.yapsonToken?'<span class="tag-ok">✓ OK</span>':'<span class="tag-err">✗ manquant</span>'}
+<div><div class="seclbl" style="color:var(--b)">app.connectpro.yapson.net</div>
+<div class="frow"><label>Token ConnectPro (accessToken)</label>
+<input type="password" name="connectproToken" value="${u.cfg.connectproToken?'●'.repeat(20):''}" placeholder="eyJhbGci...">
+${u.cfg.connectproToken?'<span class="tag-ok">✓ OK</span>':'<span class="tag-err">✗ manquant</span>'}
 </div></div>
 <div><div class="seclbl" style="color:var(--g)">my-managment.com</div>
 <div class="frow"><label>Cookies de session</label>
@@ -375,13 +468,13 @@ function adminPage(err='', ok='') {
 <td style="color:var(--o)">${u.stats.missing}</td>
 <td style="color:var(--r)">${u.stats.rejected}</td>
 <td>${parseCookies(u.cfg.mgmtCookies).length>20?'<span class="tag-ok">✓</span>':'<span class="tag-err">✗</span>'}</td>
-<td>${u.cfg.yapsonToken?'<span class="tag-ok">✓</span>':'<span class="tag-err">✗</span>'}</td>
+<td>${u.cfg.connectproToken?'<span class="tag-ok">✓</span>':'<span class="tag-err">✗</span>'}</td>
 <td><form method="POST" action="/admin/delete-user" style="display:inline"><input type="hidden" name="userId" value="${u.id}"><button class="btn btn-red" style="font-size:10px;padding:3px 8px" onclick="return confirm('Supprimer ${u.username} ?')">Supprimer</button></form></td>
 </tr>`).join('');
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Bot7-H Admin</title>
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Bot7-H-CP Admin</title>
 <style>${CSS}</style></head><body><div class="wrap">
 <div style="display:flex;justify-content:space-between;align-items:center">
-  <div style="color:var(--p);font-weight:700;font-size:1.1rem">🛡 Administration — YapsonBot7-H</div>
+  <div style="color:var(--p);font-weight:700;font-size:1.1rem">🛡 Administration — YapsonBot7-H-CP</div>
   <a href="/logout" class="btn btn-gray" style="font-size:10px">Déconnexion</a>
 </div>
 ${err?`<div style="color:var(--r);font-size:11px">✘ ${err}</div>`:''}
@@ -401,7 +494,7 @@ ${ok?`<div style="color:var(--g);font-size:11px">✔ ${ok}</div>`:''}
 </div></form></div></div>
 <div class="card"><div class="ch">👥 UTILISATEURS (${list.length})</div><div class="cb">
 ${list.length===0?'<div style="color:var(--m);font-size:11px">Aucun utilisateur.</div>':`
-<table class="tbl"><tr><th>Utilisateur</th><th>Statut</th><th>Confirmés</th><th>Manquants</th><th>Rejetés</th><th>Cookies</th><th>Token</th><th>Action</th></tr>
+<table class="tbl"><tr><th>Utilisateur</th><th>Statut</th><th>Confirmés</th><th>Manquants</th><th>Rejetés</th><th>Cookies</th><th>CP Token</th><th>Action</th></tr>
 ${rows}</table>`}
 </div></div>
 <div class="card"><div class="ch">🔑 MOT DE PASSE ADMIN</div><div class="cb">
@@ -434,12 +527,12 @@ app.post('/login', (req,res) => {
 app.get('/logout',(req,res)=>{res.setHeader('Set-Cookie','session=; HttpOnly; Path=/; Max-Age=0');res.redirect('/login');});
 app.get('/',(req,res)=>{const s=getSession(req);if(!s)return res.redirect('/login');return s.isAdmin?res.redirect('/admin'):res.redirect('/dashboard');});
 
-// Routes utilisateur
 app.get('/dashboard',requireLogin,(req,res)=>{const u=users[req.session.userId];if(!u)return res.redirect('/login');res.send(userPage(u));});
+
 app.post('/user/save-accounts',requireLogin,(req,res)=>{
   const u=users[req.session.userId];if(!u)return res.redirect('/login');
-  const{yapsonToken,mgmtCookies}=req.body;
-  if(yapsonToken&&!yapsonToken.startsWith('●')){u.cfg.yapsonToken=yapsonToken.trim();ulog(u,'ok','🔑 Token mis à jour');}
+  const{connectproToken,mgmtCookies}=req.body;
+  if(connectproToken&&!connectproToken.startsWith('●')){u.cfg.connectproToken=connectproToken.trim();ulog(u,'ok','🔑 Token ConnectPro mis à jour');}
   if(mgmtCookies){const t=mgmtCookies.trim();const ok=t.startsWith('[')||/^[a-zA-Z_][a-zA-Z0-9_]*=/.test(t);const bad=t.includes('configuré')||t.includes('(coller')||t.startsWith('(');if(ok&&!bad){u.cfg.mgmtCookies=t;ulog(u,'ok',`🍪 Cookies mis à jour — ${parseCookies(t).split(';').length} cookie(s)`);}}
   ulog(u,'ok','Comptes sauvegardés');
   if(u.botActive){stopPolling(u);setTimeout(()=>startPolling(u),500);}
@@ -458,7 +551,6 @@ app.get('/user/stop', requireLogin,(req,res)=>{const u=users[req.session.userId]
 app.get('/user/run',  requireLogin,(req,res)=>{const u=users[req.session.userId];if(u)runCycle(u).catch(e=>ulog(u,'err',e.message));res.redirect('/dashboard');});
 app.get('/user/reset',requireLogin,(req,res)=>{const u=users[req.session.userId];if(u){Object.keys(u.stats).forEach(k=>u.stats[k]=0);u.logs.length=0;ulog(u,'info','Reset');}res.redirect('/dashboard');});
 
-// Routes admin
 app.get('/admin',requireAdmin,(req,res)=>res.send(adminPage()));
 app.post('/admin/create-user',requireAdmin,(req,res)=>{
   const{username,password}=req.body;
@@ -485,4 +577,4 @@ app.get('/health',(req,res)=>{
   const u=users[s.userId];return u?res.json({...u.stats,botActive:u.botActive}):res.status(404).json({error:'Introuvable'});
 });
 
-app.listen(PORT,()=>console.log(`YapsonBot7-H multi-users — port ${PORT} | Admin: ${ADMIN_USER}`));
+app.listen(PORT,()=>console.log(`YapsonBot7-H-CP (ConnectPro) — port ${PORT} | Admin: ${ADMIN_USER}`));
