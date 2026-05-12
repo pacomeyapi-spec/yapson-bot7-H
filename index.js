@@ -19,28 +19,32 @@ app.use(express.urlencoded({ extended: true }));
 
 let ADMIN_USER = process.env.ADMIN_USER || 'admin';
 let ADMIN_PASS = process.env.ADMIN_PASS || 'admin123';
-// ── Telegram Alertes ─────────────────────────────────────────
-const TG_TOKEN   = process.env.TG_TOKEN   || '8483953517:AAFoya2Q_vLreZl9YvONpkKNyixMkclXI8Q';
-const TG_CHAT_ID = process.env.TG_CHAT_ID || '1382577194';
-let _tgLastMsg = ''; let _tgLastTime = 0;
-function sendTelegram(msg) {
+// ── Alertes ntfy.sh ──────────────────────────────────────────
+const NTFY_TOPIC = process.env.NTFY_TOPIC || 'YapsRt';
+let _ntfyLastMsg = ''; let _ntfyLastTime = 0;
+function sendNotif(title, msg, priority) {
   const now = Date.now();
-  if (msg === _tgLastMsg && now - _tgLastTime < 60000) return;
-  _tgLastMsg = msg; _tgLastTime = now;
+  const key = title + msg;
+  if (key === _ntfyLastMsg && now - _ntfyLastTime < 60000) return;
+  _ntfyLastMsg = key; _ntfyLastTime = now;
   const https = require('https');
-  const body = JSON.stringify({chat_id: TG_CHAT_ID, text: msg, parse_mode: 'HTML'});
+  const body = msg;
   const opts = {
-    hostname: 'api.telegram.org',
-    path: '/bot' + TG_TOKEN + '/sendMessage',
+    hostname: 'ntfy.sh',
+    path: '/' + NTFY_TOPIC,
     method: 'POST',
-    headers: {'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body)},
+    headers: {
+      'Title': title,
+      'Priority': priority || 'default',
+      'Tags': priority === 'urgent' ? 'rotating_light' : 'warning',
+      'Content-Length': Buffer.byteLength(body),
+    },
   };
   const req = https.request(opts, (res) => {
-    let data = '';
-    res.on('data', d => data += d);
-    res.on('end', () => console.log('[TG] Alerte envoyée:', res.statusCode, data.substring(0,80)));
+    res.on('data', () => {});
+    res.on('end', () => console.log('[NTFY] Alerte envoyée:', res.statusCode));
   });
-  req.on('error', (e) => console.error('[TG] Erreur envoi:', e.message));
+  req.on('error', (e) => console.error('[NTFY] Erreur envoi:', e.message));
   req.write(body);
   req.end();
 }
@@ -91,9 +95,9 @@ function ulog(u, type, msg) {
   if (u.logs.length > 500) u.logs.pop();
   console.log('['+u.username+']['+type.toUpperCase()+'] '+ts+' — '+msg);
   if (type === 'err') {
-    sendTelegram('\u26a0 Bot7-H [' + u.username + '] ERREUR\n' + msg.substring(0,300));
+    sendNotif('Bot7-H ERREUR [' + u.username + ']', msg.substring(0,300), 'urgent');
   } else if (type === 'warn') {
-    sendTelegram('\u26a0 Bot7-H [' + u.username + '] AVERTISSEMENT\n' + msg.substring(0,300));
+    sendNotif('Bot7-H ALERTE [' + u.username + ']', msg.substring(0,300), 'high');
   }
 }
 
