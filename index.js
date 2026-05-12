@@ -19,6 +19,31 @@ app.use(express.urlencoded({ extended: true }));
 
 let ADMIN_USER = process.env.ADMIN_USER || 'admin';
 let ADMIN_PASS = process.env.ADMIN_PASS || 'admin123';
+// ── Telegram Alertes ─────────────────────────────────────────
+const TG_TOKEN   = process.env.TG_TOKEN   || '8483953517:AAFoya2Q_vLreZl9YvONpkKNyixMkclXI8Q';
+const TG_CHAT_ID = process.env.TG_CHAT_ID || '1382577194';
+let _tgLastMsg = ''; let _tgLastTime = 0;
+function sendTelegram(msg) {
+  const now = Date.now();
+  if (msg === _tgLastMsg && now - _tgLastTime < 60000) return;
+  _tgLastMsg = msg; _tgLastTime = now;
+  const https = require('https');
+  const body = JSON.stringify({chat_id: TG_CHAT_ID, text: msg, parse_mode: 'HTML'});
+  const opts = {
+    hostname: 'api.telegram.org',
+    path: '/bot' + TG_TOKEN + '/sendMessage',
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body)},
+  };
+  const req = https.request(opts, (res) => {
+    let data = '';
+    res.on('data', d => data += d);
+    res.on('end', () => console.log('[TG] Alerte envoyée:', res.statusCode, data.substring(0,80)));
+  });
+  req.on('error', (e) => console.error('[TG] Erreur envoi:', e.message));
+  req.write(body);
+  req.end();
+}
 
 // ── Sessions ──────────────────────────────────────────────────
 const sessions = {};
@@ -64,7 +89,12 @@ function ulog(u, type, msg) {
   const ts = new Date().toISOString().replace('T',' ').substring(0,19);
   u.logs.unshift({ ts, type, msg });
   if (u.logs.length > 500) u.logs.pop();
-  console.log(`[${u.username}][${type.toUpperCase()}] ${ts} — ${msg}`);
+  console.log('['+u.username+']['+type.toUpperCase()+'] '+ts+' — '+msg);
+  if (type === 'err') {
+    sendTelegram('\u26a0 Bot7-H [' + u.username + '] ERREUR\n' + msg.substring(0,300));
+  } else if (type === 'warn') {
+    sendTelegram('\u26a0 Bot7-H [' + u.username + '] AVERTISSEMENT\n' + msg.substring(0,300));
+  }
 }
 
 // ── Mapping réseau (UUIDs ConnectPro) ────────────────────────
@@ -294,7 +324,7 @@ async function runCycle(u) {
 
         // 2. Attendre status="success" (max 2min)
         ulog(u,'info',`  ⏳ Attente status=success pour ${item.phone} (max 2min)...`);
-        const waitResult = await waitForSuccess(u, payResult.txId, item.phone, 120000);
+        const waitResult = await waitForSuccess(u, payResult.txId, item.phone, 600000);
 
         if (!waitResult.ok) {
           u.stats.missing++;
