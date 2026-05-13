@@ -84,6 +84,7 @@ function createUser(username, password) {
     },
     stats: { confirmed:0, missing:0, fixed:0, polls:0, rejected:0 },
     logs: [],
+    blacklist: new Set(),
     pollTimer: null, isRunning: false, botActive: false,
   };
   return users[id];
@@ -174,6 +175,7 @@ async function getAllWithdrawals(u) {
     const sid     = cd?.subagent_id;
     const subagentName = row.subagent || `Fournisseur_${sid}`;
     if (!pm || montant <= 0 || !cd || !sid) continue;
+    if (u.blacklist && u.blacklist.has(pm[0])) { ulog(u,'info',`  ⏭ ${pm[0]} ignoré (blacklist)`); continue; }
     if (!groups[sid]) groups[sid] = { subagent_id:sid, subagentName, netTitle, network:detectNetwork(netTitle), items:[] };
     groups[sid].items.push({ phone:pm[0], montant, confirmData:cd, netTitle });
   }
@@ -332,7 +334,8 @@ async function runCycle(u) {
 
         if (!waitResult.ok) {
           u.stats.missing++;
-          ulog(u,'warn',`  ⚠ ${waitResult.err}`);
+          u.blacklist.add(item.phone);
+          ulog(u,'warn',`  ⛔ ${item.phone} ajouté à la blacklist — ${waitResult.err}`);
           processed = true; break;
         }
         ulog(u,'ok',`  ✔ Transaction SUCCESS: ${String(waitResult.tx?.uid||waitResult.tx?.id||'?').substring(0,10)}`);
@@ -583,7 +586,7 @@ app.post('/user/save-config',requireLogin,(req,res)=>{
 app.get('/user/start',requireLogin,(req,res)=>{const u=users[req.session.userId];if(u)startPolling(u);res.redirect('/dashboard');});
 app.get('/user/stop', requireLogin,(req,res)=>{const u=users[req.session.userId];if(u)stopPolling(u); res.redirect('/dashboard');});
 app.get('/user/run',  requireLogin,(req,res)=>{const u=users[req.session.userId];if(u)runCycle(u).catch(e=>ulog(u,'err',e.message));res.redirect('/dashboard');});
-app.get('/user/reset',requireLogin,(req,res)=>{const u=users[req.session.userId];if(u){Object.keys(u.stats).forEach(k=>u.stats[k]=0);u.logs.length=0;ulog(u,'info','Reset');}res.redirect('/dashboard');});
+app.get('/user/reset',requireLogin,(req,res)=>{const u=users[req.session.userId];if(u){Object.keys(u.stats).forEach(k=>u.stats[k]=0);u.logs.length=0;u.blacklist.clear();ulog(u,'info','Reset + blacklist vidée');}res.redirect('/dashboard');});
 
 app.get('/admin',requireAdmin,(req,res)=>res.send(adminPage()));
 app.post('/admin/create-user',requireAdmin,(req,res)=>{
