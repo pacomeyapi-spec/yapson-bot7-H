@@ -334,6 +334,7 @@ async function runCycle(u) {
 
         if (!waitResult.ok) {
           u.stats.missing++;
+          if (!u.blacklist) u.blacklist = new Set();
           u.blacklist.add(item.phone);
           ulog(u,'warn',`  ⛔ ${item.phone} ajouté à la blacklist — ${waitResult.err}`);
           processed = true; break;
@@ -586,7 +587,7 @@ app.post('/user/save-config',requireLogin,(req,res)=>{
 app.get('/user/start',requireLogin,(req,res)=>{const u=users[req.session.userId];if(u)startPolling(u);res.redirect('/dashboard');});
 app.get('/user/stop', requireLogin,(req,res)=>{const u=users[req.session.userId];if(u)stopPolling(u); res.redirect('/dashboard');});
 app.get('/user/run',  requireLogin,(req,res)=>{const u=users[req.session.userId];if(u)runCycle(u).catch(e=>ulog(u,'err',e.message));res.redirect('/dashboard');});
-app.get('/user/reset',requireLogin,(req,res)=>{const u=users[req.session.userId];if(u){Object.keys(u.stats).forEach(k=>u.stats[k]=0);u.logs.length=0;u.blacklist.clear();ulog(u,'info','Reset + blacklist vidée');}res.redirect('/dashboard');});
+app.get('/user/reset',requireLogin,(req,res)=>{const u=users[req.session.userId];if(u){Object.keys(u.stats).forEach(k=>u.stats[k]=0);u.logs.length=0;if(u.blacklist)u.blacklist.clear();ulog(u,'info','Reset + blacklist vidée');}res.redirect('/dashboard');});
 
 app.get('/admin',requireAdmin,(req,res)=>res.send(adminPage()));
 app.post('/admin/create-user',requireAdmin,(req,res)=>{
