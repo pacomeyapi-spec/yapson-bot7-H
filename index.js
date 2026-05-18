@@ -53,7 +53,7 @@ function sendNotif(title, msg, priority) {
 const sessions = {};
 function createSession(userId, isAdmin) {
   const token = crypto.randomBytes(32).toString('hex');
-  sessions[token] = { userId, isAdmin, expires: Date.now() + 8*3600*1000 };
+  sessions[token] = { userId, isAdmin, expires: Date.now() + 10*365*24*3600*1000 }; // 10 ans
   return token;
 }
 function getSession(req) {
@@ -551,13 +551,13 @@ app.post('/login', (req,res) => {
   const{username,password}=req.body;
   if(username===ADMIN_USER&&password===ADMIN_PASS){
     const tok=createSession('admin',true);
-    res.setHeader('Set-Cookie',`session=${tok}; HttpOnly; Path=/; Max-Age=28800`);
+    res.setHeader('Set-Cookie',`session=${tok}; HttpOnly; Path=/; Max-Age=315360000`);
     return res.redirect('/admin');
   }
   const u=Object.values(users).find(u=>u.username===username&&u.passwordHash===hashPass(password));
   if(u){
     const tok=createSession(u.id,false);
-    res.setHeader('Set-Cookie',`session=${tok}; HttpOnly; Path=/; Max-Age=28800`);
+    res.setHeader('Set-Cookie',`session=${tok}; HttpOnly; Path=/; Max-Age=315360000`);
     return res.redirect('/dashboard');
   }
   res.send(loginPage('Identifiants incorrects'));
