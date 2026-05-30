@@ -11,14 +11,34 @@ const express  = require('express');
 const fetch    = require('node-fetch');
 const FormData = require('form-data');
 const crypto   = require('crypto');
+const { chromium } = require('playwright');
+const { initializeApp, cert } = require('firebase-admin/app');
+const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 
 const app  = express();
 const PORT = parseInt(process.env.PORT || '8080', 10);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// ── Firebase Firestore (persistance des comptes agents) ───────
+let db = null;
+try {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
+  if (serviceAccount && serviceAccount.project_id) {
+    initializeApp({ credential: cert(serviceAccount) });
+    db = getFirestore();
+    console.log('✅ Firebase Firestore connecté — comptes persistés');
+  } else {
+    console.error('⚠ FIREBASE_SERVICE_ACCOUNT manquant — persistance DÉSACTIVÉE (comptes en mémoire, perdus au redéploiement)');
+  }
+} catch(e) {
+  console.error('❌ Firebase init échoué:', e.message, '— persistance désactivée');
+  db = null;
+}
+
 let ADMIN_USER = process.env.ADMIN_USER || 'admin';
 let ADMIN_PASS = process.env.ADMIN_PASS || 'admin123';
+const MGMT_URL = (process.env.MGMT_URL || 'https://my-managment.com').replace(/\/$/, '');
 // ── Alertes ntfy.sh ──────────────────────────────────────────
 const NTFY_TOPIC = process.env.NTFY_TOPIC || 'YapsRt';
 let _ntfyLastMsg = ''; let _ntfyLastTime = 0;
@@ -70,14 +90,12 @@ function requireAdmin(req, res, next) { const s=getSession(req); if(!s||!s.isAdm
 const users = {};
 function hashPass(p) { return crypto.createHash('sha256').update(p).digest('hex'); }
 
-function createUser(username, password) {
-  const id = crypto.randomBytes(8).toString('hex');
-  users[id] = {
-    id, username,
-    passwordHash: hashPass(password),
+function buildUser(id, username, passwordHash) {
+  return {
+    id, username, passwordHash,
     cfg: {
       mgmtCookies    : '',
-      connectproToken: '',   // JWT accessToken de app.connectpro.yapson.net
+      connectproToken: '',
       reportId       : process.env.REPORT_ID || '8231c3be3216307da83c067d263c09ec',
       pollInterval   : parseInt(process.env.POLL_INTERVAL || '600'),
       maxSolde       : parseInt(process.env.MAX_SOLDE || '0'),
@@ -86,8 +104,66 @@ function createUser(username, password) {
     logs: [],
     blacklist: new Set(),
     pollTimer: null, isRunning: false, botActive: false,
+    // Navigateur intégré (login manuel iPad/mobile)
+    loginBrowser: null, loginPage: null, loginScreenshot: null,
   };
-  return users[id];
+}
+
+function createUser(username, password) {
+  const id = crypto.randomBytes(8).toString('hex');
+  const u = buildUser(id, username, hashPass(password));
+  users[id] = u;
+  saveUser(u);
+  return u;
+}
+
+// ── Persistance Firebase ──────────────────────────────────────
+async function saveUser(u) {
+  if (!db || !u) return;
+  try {
+    await db.collection('bot7h_users').doc(u.id).set({
+      id: u.id, username: u.username, passwordHash: u.passwordHash,
+      cfg: u.cfg, botActive: !!u.botActive,
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  } catch(e) { console.error(`[Firebase] saveUser: ${e.message}`); }
+}
+
+async function deleteUserFromDB(userId) {
+  if (!db) return;
+  try { await db.collection('bot7h_users').doc(userId).delete(); }
+  catch(e) { console.error(`[Firebase] deleteUser: ${e.message}`); }
+}
+
+async function loadUsersFromDB() {
+  if (!db) return;
+  try {
+    const snap = await db.collection('bot7h_users').get();
+    let count = 0;
+    for (const doc of snap.docs) {
+      const d = doc.data();
+      const u = buildUser(d.id, d.username, d.passwordHash);
+      if (d.cfg) u.cfg = { ...u.cfg, ...d.cfg };
+      users[u.id] = u;
+      count++;
+      if (d.botActive) { try { startPolling(u); } catch(e){ console.error('resume:', e.message); } }
+    }
+    console.log(`✅ ${count} compte(s) agent chargé(s) depuis Firebase`);
+  } catch(e) { console.error(`[Firebase] loadUsers: ${e.message}`); }
+}
+
+async function saveAdminPass(newPass) {
+  if (!db) return;
+  try { await db.collection('bot7h_config').doc('admin').set({ password: newPass }, { merge: true }); }
+  catch(e) { console.error(`[Firebase] saveAdminPass: ${e.message}`); }
+}
+
+async function loadAdminPass() {
+  if (!db) return;
+  try {
+    const doc = await db.collection('bot7h_config').doc('admin').get();
+    if (doc.exists && doc.data().password) { ADMIN_PASS = doc.data().password; console.log('✅ Mot de passe admin chargé depuis Firebase'); }
+  } catch(e) { console.error(`[Firebase] loadAdminPass: ${e.message}`); }
 }
 
 function ulog(u, type, msg) {
@@ -438,6 +514,7 @@ function userPage(u) {
     return `<div class="le ${cls}"><span class="lt">${e.ts}</span><span>${ic} ${e.msg}</span></div>`;
   }).join('');
   const hasSession = parseCookies(u.cfg.mgmtCookies).length > 20;
+  const hasNav = u.loginBrowser && u.loginBrowser.isConnected() && u.loginPage && !u.loginPage.isClosed();
   return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Bot7-H-CP — ${u.username}</title>
 <style>${CSS}</style>
 <script>if(${JSON.stringify(u.botActive)}) setTimeout(()=>location.reload(),15000);</script>
@@ -452,6 +529,13 @@ function userPage(u) {
 <div class="sc vp"><div class="sv">${u.stats.polls}</div><div class="sl">Polls</div></div>
 <div class="sc vr"><div class="sv">${u.stats.rejected}</div><div class="sl">Rejetés</div></div>
 </div>
+<div class="card" style="border:2px solid var(--g)"><div class="ch" style="color:var(--g)">🌐 CONNEXION VIA NAVIGATEUR INTÉGRÉ (iPad / mobile)</div><div class="cb">
+<div style="font-size:11px;color:var(--m);margin-bottom:10px">Connecte-toi à my-managment.com sans extraire les cookies manuellement.</div>
+<div class="btns">
+<a href="/user/browser" class="btn btn-go">🌐 Ouvrir navigateur</a>
+${hasNav?`<form method="POST" action="/user/browser/close" style="display:inline"><button class="btn btn-stop">✕ Fermer</button></form><span style="font-size:11px;color:var(--g);margin-left:8px">● Navigateur actif</span>`:`<span style="font-size:11px;color:var(--m)">● Navigateur fermé</span>`}
+</div>
+</div></div>
 <div class="card"><div class="ch">🔑 COMPTES</div><div class="cb">
 <div class="info-box">
   <strong>ConnectPro</strong> — Récupérer le token sur <code>app.connectpro.yapson.net</code> :<br>
@@ -573,6 +657,7 @@ app.post('/user/save-accounts',requireLogin,(req,res)=>{
   if(connectproToken&&!connectproToken.startsWith('●')){u.cfg.connectproToken=connectproToken.trim();ulog(u,'ok','🔑 Token ConnectPro mis à jour');}
   if(mgmtCookies){const t=mgmtCookies.trim();const ok=t.startsWith('[')||/^[a-zA-Z_][a-zA-Z0-9_]*=/.test(t);const bad=t.includes('configuré')||t.includes('(coller')||t.startsWith('(');if(ok&&!bad){u.cfg.mgmtCookies=t;ulog(u,'ok',`🍪 Cookies mis à jour — ${parseCookies(t).split(';').length} cookie(s)`);}}
   ulog(u,'ok','Comptes sauvegardés');
+  saveUser(u);
   if(u.botActive){stopPolling(u);setTimeout(()=>startPolling(u),500);}
   res.redirect('/dashboard');
 });
@@ -581,11 +666,12 @@ app.post('/user/save-config',requireLogin,(req,res)=>{
   if(req.body.pollInterval)u.cfg.pollInterval=Math.max(60,parseInt(req.body.pollInterval));
   if(req.body.maxSolde!==undefined)u.cfg.maxSolde=parseInt(req.body.maxSolde)||0;
   ulog(u,'ok',`Config: intervalle=${u.cfg.pollInterval}s`);
+  saveUser(u);
   if(u.botActive){stopPolling(u);setTimeout(()=>startPolling(u),500);}
   res.redirect('/dashboard');
 });
-app.get('/user/start',requireLogin,(req,res)=>{const u=users[req.session.userId];if(u)startPolling(u);res.redirect('/dashboard');});
-app.get('/user/stop', requireLogin,(req,res)=>{const u=users[req.session.userId];if(u)stopPolling(u); res.redirect('/dashboard');});
+app.get('/user/start',requireLogin,(req,res)=>{const u=users[req.session.userId];if(u){startPolling(u);saveUser(u);}res.redirect('/dashboard');});
+app.get('/user/stop', requireLogin,(req,res)=>{const u=users[req.session.userId];if(u){stopPolling(u);saveUser(u);} res.redirect('/dashboard');});
 app.get('/user/run',  requireLogin,(req,res)=>{const u=users[req.session.userId];if(u)runCycle(u).catch(e=>ulog(u,'err',e.message));res.redirect('/dashboard');});
 app.get('/user/reset',requireLogin,(req,res)=>{const u=users[req.session.userId];if(u){Object.keys(u.stats).forEach(k=>u.stats[k]=0);u.logs.length=0;if(u.blacklist)u.blacklist.clear();ulog(u,'info','Reset + blacklist vidée');}res.redirect('/dashboard');});
 
@@ -599,7 +685,7 @@ app.post('/admin/create-user',requireAdmin,(req,res)=>{
 });
 app.post('/admin/delete-user',requireAdmin,(req,res)=>{
   const u=users[req.body.userId];if(!u)return res.send(adminPage('Introuvable'));
-  const name=u.username;stopPolling(u);delete users[req.body.userId];
+  const name=u.username;stopPolling(u);if(u.loginBrowser)u.loginBrowser.close().catch(()=>{});delete users[req.body.userId];deleteUserFromDB(req.body.userId);
   res.send(adminPage('',`"${name}" supprimé ✔`));
 });
 app.post('/admin/change-password',requireAdmin,(req,res)=>{
@@ -607,6 +693,7 @@ app.post('/admin/change-password',requireAdmin,(req,res)=>{
   if(oldPass!==ADMIN_PASS)return res.send(adminPage('Ancien mot de passe incorrect'));
   if(!newPass||newPass.length<4)return res.send(adminPage('Mot de passe trop court'));
   ADMIN_PASS=newPass;
+  saveAdminPass(newPass);
   res.send(adminPage('','Mot de passe admin changé ✔'));
 });
 app.get('/health',(req,res)=>{
@@ -615,4 +702,162 @@ app.get('/health',(req,res)=>{
   const u=users[s.userId];return u?res.json({...u.stats,botActive:u.botActive}):res.status(404).json({error:'Introuvable'});
 });
 
-app.listen(PORT,()=>console.log(`YapsonBot7-H-CP (ConnectPro) — port ${PORT} | Admin: ${ADMIN_USER}`));
+// ── NAVIGATEUR INTÉGRÉ (ajouté) ──────────────────────────────
+// ── NAVIGATEUR INTÉGRÉ ────────────────────────────────────────
+async function installPlaywright() {
+try{require('child_process').execSync('npx playwright install chromium --with-deps',{stdio:'inherit',timeout:120000});}catch{}
+}
+async function ensureLoginBrowser(u) {
+if (!u.loginBrowser||!u.loginBrowser.isConnected()) {
+ulog(u,'info','🌐 Lancement navigateur login…');
+try { u.loginBrowser=await chromium.launch({headless:true,args:['--no-sandbox','--disable-setuid-sandbox','--window-size=390,844']}); }
+catch(e) { if(e.message.includes('Executable')||e.message.includes("doesn't exist")){await installPlaywright();u.loginBrowser=await chromium.launch({headless:true,args:['--no-sandbox','--disable-setuid-sandbox','--window-size=390,844']});}else throw e; }
+}
+if (!u.loginPage||u.loginPage.isClosed()) {
+u.loginPage=await u.loginBrowser.newPage();
+await u.loginPage.setViewportSize({width:390,height:844});
+await u.loginPage.setExtraHTTPHeaders({'Accept-Language':'fr-FR,fr;q=0.9'});
+}
+}
+async function captureLoginScreenshot(u) {
+try {
+if(!u.loginPage||u.loginPage.isClosed()) return null;
+const buf=await u.loginPage.screenshot({type:'jpeg',quality:70,fullPage:false});
+u.loginScreenshot=buf.toString('base64');
+return u.loginScreenshot;
+} catch{return null;}
+}
+async function startScreenshotLoop(u) {
+while(u.loginBrowser&&u.loginBrowser.isConnected()&&u.loginPage&&!u.loginPage.isClosed()){
+await captureLoginScreenshot(u);
+await new Promise(r=>setTimeout(r,500));
+}
+}
+
+app.post('/user/browser/open', requireLogin, async(req,res)=>{
+const u=users[req.session.userId]; if(!u) return res.redirect('/login');
+try{await ensureLoginBrowser(u);await u.loginPage.goto(MGMT_URL,{waitUntil:'domcontentloaded',timeout:30000});ulog(u,'info','🌐 Navigateur login ouvert');startScreenshotLoop(u).catch(()=>{});res.redirect('/user/browser');}
+catch(e){ulog(u,'err',`Navigateur login: ${e.message}`);res.redirect('/dashboard');}
+});
+app.post('/user/browser/close', requireLogin, async(req,res)=>{
+const u=users[req.session.userId]; if(!u) return res.redirect('/login');
+try{if(u.loginBrowser){await u.loginBrowser.close();u.loginBrowser=null;u.loginPage=null;}ulog(u,'info','🌐 Navigateur login fermé');}catch{}
+res.redirect('/dashboard');
+});
+app.post('/user/browser/click', requireLogin, async(req,res)=>{
+const u=users[req.session.userId]; if(!u) return res.status(400).json({error:'user not found'});
+const{x,y}=req.body;
+try{if(u.loginPage&&!u.loginPage.isClosed()){await u.loginPage.mouse.click(parseFloat(x),parseFloat(y));await new Promise(r=>setTimeout(r,300));await captureLoginScreenshot(u);}res.json({ok:true});}
+catch(e){res.json({error:e.message});}
+});
+app.post('/user/browser/type', requireLogin, async(req,res)=>{
+const u=users[req.session.userId]; if(!u) return res.status(400).json({error:'user not found'});
+const{text}=req.body;
+try{if(u.loginPage&&!u.loginPage.isClosed()){await u.loginPage.keyboard.type(text,{delay:50});await new Promise(r=>setTimeout(r,200));await captureLoginScreenshot(u);}res.json({ok:true});}
+catch(e){res.json({error:e.message});}
+});
+app.post('/user/browser/goto', requireLogin, async(req,res)=>{
+const u=users[req.session.userId]; if(!u) return res.status(400).json({error:'user not found'});
+const{url}=req.body;
+try{if(u.loginPage&&!u.loginPage.isClosed()){await u.loginPage.goto(url,{waitUntil:'domcontentloaded',timeout:20000});await new Promise(r=>setTimeout(r,500));await captureLoginScreenshot(u);}res.json({ok:true});}
+catch(e){res.json({error:e.message});}
+});
+app.post('/user/browser/key', requireLogin, async(req,res)=>{
+const u=users[req.session.userId]; if(!u) return res.status(400).json({error:'user not found'});
+const{key}=req.body;
+try{if(u.loginPage&&!u.loginPage.isClosed()){await u.loginPage.keyboard.press(key);await new Promise(r=>setTimeout(r,300));await captureLoginScreenshot(u);}res.json({ok:true});}
+catch(e){res.json({error:e.message});}
+});
+app.post('/user/browser/capture-cookies', requireLogin, async(req,res)=>{
+const u=users[req.session.userId]; if(!u) return res.status(400).json({error:'user not found'});
+try{
+if(!u.loginPage||u.loginPage.isClosed()) return res.json({error:'Navigateur fermé'});
+const currentUrl=u.loginPage.url();
+if(currentUrl.includes('login')||currentUrl.includes('signin')) return res.json({error:'Pas encore connecté — complète le login puis clique Capturer'});
+const ctx=u.loginPage.context();
+const cookies=await ctx.cookies();
+const mgmtCookies=cookies.filter(c=>c.domain.includes('my-managment')||c.domain.includes('managment'));
+if(mgmtCookies.length===0) return res.json({error:'Aucun cookie my-managment trouvé'});
+const cookieStr=JSON.stringify(mgmtCookies);
+u.cfg.mgmtCookies=cookieStr;
+saveUser(u);
+ulog(u,'ok',`🍪 ${mgmtCookies.length} cookie(s) capturés depuis navigateur intégré`);
+res.json({ok:true,count:mgmtCookies.length});
+}catch(e){res.json({error:e.message});}
+});
+app.get('/user/browser/screenshot', requireLogin, async(req,res)=>{
+const u=users[req.session.userId]; if(!u) return res.status(404).end();
+try{await captureLoginScreenshot(u);if(!u.loginScreenshot) return res.status(204).end();res.setHeader('Content-Type','image/jpeg');res.send(Buffer.from(u.loginScreenshot,'base64'));}
+catch{res.status(500).end();}
+});
+
+app.get('/user/browser', requireLogin, (req,res)=>{
+const u=users[req.session.userId]; if(!u) return res.redirect('/login');
+const hasNav=u.loginBrowser&&u.loginBrowser.isConnected()&&u.loginPage&&!u.loginPage.isClosed();
+res.send(`<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
+<title>Navigateur — ${u.username}</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:#0f1117;color:#e2e8f0;font-family:monospace;display:flex;flex-direction:column;height:100vh;height:100dvh;overflow:hidden}
+#topbar{background:#1e1e2e;padding:8px;padding-top:calc(8px + env(safe-area-inset-top,0));display:flex;gap:6px;align-items:center;flex-shrink:0;flex-wrap:wrap}
+#urlbar{flex:1;background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:6px;padding:5px 8px;font-size:13px}
+.tbtn{border:none;border-radius:6px;padding:5px 10px;font-size:12px;font-weight:bold;cursor:pointer;white-space:nowrap}
+.tbtn-green{background:#a6e3a1;color:#1e1e2e}.tbtn-blue{background:#89b4fa;color:#1e1e2e}
+.tbtn-red{background:#f38ba8;color:#1e1e2e}.tbtn-orange{background:#fab387;color:#1e1e2e}
+#screen-wrap{flex:1 1 auto;min-height:0;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;background:#000;cursor:crosshair}
+#screen{max-width:100%;max-height:100%;display:block;touch-action:none}
+#keyboard{background:#1e1e2e;padding:6px;padding-bottom:calc(6px + env(safe-area-inset-bottom,0));flex-shrink:0}
+#textinput{width:100%;background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:6px;padding:6px;font-size:14px;margin-bottom:5px}
+.keyrow{display:flex;gap:4px;margin-bottom:4px;justify-content:center;flex-wrap:wrap}
+#keyboard .keyrow .tbtn{padding:10px 12px;font-size:13px}
+#capture-btn{background:#a6e3a1;color:#1e1e2e;border:none;border-radius:8px;padding:10px;font-size:14px;font-weight:bold;cursor:pointer;width:100%;margin-top:4px}
+#status-bar{background:#0a0e18;padding:4px 8px;font-size:10px;color:#6c7086;flex-shrink:0}
+</style></head><body>
+<div id="topbar">
+  <a href="/dashboard" class="tbtn tbtn-red">← Retour</a>
+  <input id="urlbar" type="text" value="${MGMT_URL}">
+  <button class="tbtn tbtn-blue" onclick="gotoUrl()">Aller</button>
+  ${hasNav?'':`<form method="POST" action="/user/browser/open" style="display:inline"><button class="tbtn tbtn-green" type="submit">▶ Ouvrir</button></form>`}
+</div>
+${hasNav?`
+<div id="screen-wrap"><img id="screen" src="/user/browser/screenshot?t=${Date.now()}" alt="Navigateur"></div>
+<div id="keyboard">
+  <input id="textinput" type="text" placeholder="Tape ici puis appuie sur Envoyer…">
+  <div class="keyrow">
+    <button class="tbtn tbtn-blue" style="flex:2" onclick="sendText()">Envoyer texte</button>
+    <button class="tbtn tbtn-orange" style="flex:2" onclick="sendKey('Enter')">Entrée ↵</button>
+    <button class="tbtn tbtn-red" style="flex:1" onclick="sendKey('Backspace')">⌫</button>
+    <button class="tbtn" style="background:#313244;color:#cdd6f4;flex:1" onclick="sendKey('Tab')">Tab</button>
+  </div>
+  <button id="capture-btn" onclick="captureCookies()">🍪 Je suis connecté — Capturer les cookies</button>
+</div>
+<div id="status-bar">Prêt — Clique sur l'écran pour interagir</div>
+<script>
+const screen=document.getElementById('screen'),statusBar=document.getElementById('status-bar'),textInput=document.getElementById('textinput'),urlbar=document.getElementById('urlbar');
+let polling=true;
+async function pollScreenshot(){while(polling){try{const r=await fetch('/user/browser/screenshot?t='+Date.now());if(r.ok){const blob=await r.blob();const url=URL.createObjectURL(blob);const old=screen.src;screen.src=url;if(old.startsWith('blob:'))URL.revokeObjectURL(old);}}catch{}await new Promise(r=>setTimeout(r,500));}}
+pollScreenshot();
+screen.addEventListener('click',async(e)=>{const rect=screen.getBoundingClientRect();const x=(e.clientX-rect.left)*390/rect.width;const y=(e.clientY-rect.top)*844/rect.height;statusBar.textContent='Clic à ('+Math.round(x)+', '+Math.round(y)+')…';await fetch('/user/browser/click',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'x='+x+'&y='+y});statusBar.textContent='Clic effectué';});
+screen.addEventListener('touchend',async(e)=>{e.preventDefault();const touch=e.changedTouches[0];const rect=screen.getBoundingClientRect();const x=(touch.clientX-rect.left)*390/rect.width;const y=(touch.clientY-rect.top)*844/rect.height;await fetch('/user/browser/click',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'x='+x+'&y='+y});});
+async function sendText(){const text=textInput.value;if(!text)return;await fetch('/user/browser/type',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'text='+encodeURIComponent(text)});textInput.value='';statusBar.textContent='Texte envoyé';}
+async function sendKey(key){await fetch('/user/browser/key',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'key='+encodeURIComponent(key)});statusBar.textContent='Touche: '+key;}
+async function gotoUrl(){statusBar.textContent='Navigation…';await fetch('/user/browser/goto',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(urlbar.value)});}
+async function captureCookies(){statusBar.textContent='Capture des cookies…';document.getElementById('capture-btn').disabled=true;const r=await fetch('/user/browser/capture-cookies',{method:'POST'});const data=await r.json();if(data.ok){statusBar.textContent='✅ '+data.count+' cookies capturés ! Retour au dashboard…';document.getElementById('capture-btn').textContent='✅ Cookies capturés !';setTimeout(()=>{window.location='/dashboard';},2000);}else{statusBar.textContent='❌ '+(data.error||'Erreur');document.getElementById('capture-btn').disabled=false;}}
+textInput.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();sendText();}});
+</script>`:`
+<div style="flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:16px;padding:20px;text-align:center">
+  <div style="font-size:48px">🌐</div>
+  <div style="color:#a6e3a1;font-size:16px">Navigateur intégré</div>
+  <div style="color:#6c7086;font-size:12px;max-width:300px">Connecte-toi à my-managment.com manuellement, puis clique <strong>Capturer les cookies</strong>.</div>
+  <form method="POST" action="/user/browser/open"><button type="submit" style="background:#a6e3a1;color:#1e1e2e;border:none;border-radius:8px;padding:12px 24px;font-size:14px;font-weight:bold;cursor:pointer">▶ Ouvrir le navigateur</button></form>
+</div>`}
+</body></html>`);
+});
+
+app.listen(PORT, async ()=>{
+  console.log(`YapsonBot7-H-CP (ConnectPro) — port ${PORT} | Admin: ${ADMIN_USER}`);
+  await loadAdminPass();
+  await loadUsersFromDB();
+});
