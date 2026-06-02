@@ -96,6 +96,8 @@ function buildUser(id, username, passwordHash) {
     cfg: {
       mgmtCookies    : '',
       connectproToken: '',
+      yapsonToken    : '',
+      platforms      : { WAVE: 'connectpro', ORANGE: 'connectpro' },
       reportId       : process.env.REPORT_ID || '8231c3be3216307da83c067d263c09ec',
       pollInterval   : parseInt(process.env.POLL_INTERVAL || '600'),
       maxSolde       : parseInt(process.env.MAX_SOLDE || '0'),
@@ -367,13 +369,71 @@ async function confirmWithoutFile(u, item) {
 }
 
 // ── Cycle principal — 1 seul retrait par cycle ────────────────
+// ── yapson-transfer : décaissement APP (Wave/Orange) via appareil ─
+const YAPSON_URL = (process.env.YAPSON_URL || 'https://yapson-transfer-production.up.railway.app').replace(/\/$/,'');
+// WAVE / ORANGE : connectpro (défaut) | yapson. MTN/Moov : connectpro (inchangé).
+function choosePlatform(u, operator) {
+  const sel = (u.cfg.platforms && u.cfg.platforms[operator]) || '';
+  if ((operator === 'WAVE' || operator === 'ORANGE') && sel === 'yapson' && u.cfg.yapsonToken) return 'yapson';
+  return 'connectpro';
+}
+async function createYapsonPayout(u, { operator, amount, phone, recipientName, ref }) {
+  try {
+    const res = await fetch(`${YAPSON_URL}/api/ext/payout`, {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json', 'x-agent-token':u.cfg.yapsonToken },
+      body: JSON.stringify({ operator, amount, phoneNumber:phone, recipientName, clientRef:ref }),
+    });
+    const j = await res.json().catch(()=>({}));
+    if (res.ok && j.ok) return { ok:true, id:j.id, reference:j.reference, status:j.status };
+    return { ok:false, err:`[${res.status}] ${j.error||''}` };
+  } catch(e) { return { ok:false, err:e.message }; }
+}
+async function pollYapson(u, id, maxWait=240000) {
+  const start = Date.now();
+  while (Date.now()-start < maxWait) {
+    await sleep(6000);
+    try {
+      const res = await fetch(`${YAPSON_URL}/api/ext/payout/${id}`, { headers:{ 'x-agent-token':u.cfg.yapsonToken } });
+      const j = await res.json().catch(()=>({}));
+      if (!res.ok) { ulog(u,'info',`  ⏳ yapson HTTP ${res.status}...`); continue; }
+      const st = String(j.status||'').toUpperCase();
+      if (st==='SUCCESS') return { ok:true, status:st, operatorRef:j.operatorRef };
+      if (st==='FAILED')  return { ok:false, status:st, err:j.error||'échec' };
+      ulog(u,'info',`  ⏳ yapson ${st}... (${Math.round((Date.now()-start)/1000)}s)`);
+    } catch(e) { ulog(u,'info',`  ⏳ yapson attente... (${Math.round((Date.now()-start)/1000)}s)`); }
+  }
+  return { ok:false, status:'TIMEOUT', err:'Timeout yapson' };
+}
+// Traite un retrait via yapson-transfer puis confirme my-managment (sans fichier, comme bot7-H).
+async function handleYapsonItem(u, item, operator) {
+  ulog(u,'info',`  🟢 yapson-transfer → ${item.phone} — ${item.montant.toLocaleString()} FCFA [${operator}]`);
+  const recipientName = (operator === 'WAVE') ? (item.recipientName || 'Client') : null;
+  const created = await createYapsonPayout(u, { operator, amount:item.montant, phone:item.phone, recipientName, ref:String(item.confirmData?.id||'') });
+  if (!created.ok) { u.stats.missing++; ulog(u,'err',`  ✘ yapson création échouée: ${item.phone} — ${created.err}`); return; }
+  ulog(u,'ok',`  ✔ Ordre yapson créé: ${item.phone} (ref ${created.reference})`);
+  const w = await pollYapson(u, created.id, 240000);
+  if (!w.ok) {
+    u.stats.missing++;
+    if (!u.blacklist) u.blacklist = new Set();
+    u.blacklist.add(item.phone);
+    ulog(u,'warn',`  ⛔ ${item.phone} blacklisté — yapson ${w.status||''} ${w.err||''}`);
+    return;
+  }
+  ulog(u,'ok',`  ✔ yapson SUCCESS: ${item.phone}${w.operatorRef?' (réf '+w.operatorRef+')':''}`);
+  await sleep(500);
+  const cr = await confirmWithoutFile(u, item);
+  if (cr.ok) { u.stats.confirmed++; ulog(u,'ok',`  ✔ Confirmé: ${item.phone}`); }
+  else { u.stats.missing++; ulog(u,'warn',`  ⚠ Confirmation échouée: ${item.phone} — ${cr.err}`); }
+}
+
 async function runCycle(u) {
   if (u.isRunning) return;
   u.isRunning = true; u.stats.polls++;
   ulog(u,'info',`━━ Poll #${u.stats.polls} ━━`);
   try {
     if (!parseCookies(u.cfg.mgmtCookies)) throw new Error('Cookies my-managment manquants');
-    if (!u.cfg.connectproToken)           throw new Error('Token ConnectPro manquant');
+    if (!u.cfg.connectproToken && !u.cfg.yapsonToken) throw new Error('Configurez ConnectPro et/ou yapson-transfer');
 
     const groups    = await getAllWithdrawals(u);
     const groupList = Object.values(groups);
@@ -390,6 +450,13 @@ async function runCycle(u) {
       for (const item of items) {
         if (processed) break;
         ulog(u,'info',`  → ${item.phone} — ${item.montant.toLocaleString()} FCFA [${network}]`);
+
+        // 0. Choix de plateforme par opérateur (Wave/Orange → yapson si configuré, sinon ConnectPro)
+        const operator = network === 'Wave' ? 'WAVE' : ((network === 'Orangeint' || network === 'ORANGE CI') ? 'ORANGE' : null);
+        if (operator && choosePlatform(u, operator) === 'yapson') {
+          await handleYapsonItem(u, item, operator);
+          processed = true; break;
+        }
 
         // 1. Décaisser via ConnectPro
         const payResult = await payout(u, item, network);
@@ -546,6 +613,24 @@ ${hasNav?`<form method="POST" action="/user/browser/close" style="display:inline
 <div class="frow"><label>Token ConnectPro (accessToken)</label>
 <input type="password" name="connectproToken" value="${u.cfg.connectproToken?'●'.repeat(20):''}" placeholder="eyJhbGci...">
 ${u.cfg.connectproToken?'<span class="tag-ok">✓ OK</span>':'<span class="tag-err">✗ manquant</span>'}
+</div>
+<div class="seclbl" style="color:var(--g);margin-top:10px">yapson-transfer (Wave / Orange via appareil)</div>
+<div class="frow"><label>Jeton agent yapson-transfer</label>
+<input type="password" name="yapsonToken" value="${u.cfg.yapsonToken?'●'.repeat(20):''}" placeholder="yat_...">
+${u.cfg.yapsonToken?'<span class="tag-ok">✓ Actif</span>':'<span class="tag-err">✗ non configuré</span>'}
+</div>
+<div class="frow"><label>Plateforme par opérateur</label>
+<div style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;font-size:12px">
+<span>Wave : <select name="platWave" style="padding:5px 8px;border-radius:6px">
+<option value="connectpro"${(u.cfg.platforms&&u.cfg.platforms.WAVE==='yapson')?'':' selected'}>ConnectPro</option>
+<option value="yapson"${(u.cfg.platforms&&u.cfg.platforms.WAVE==='yapson')?' selected':''}>yapson-transfer</option>
+</select></span>
+<span>Orange : <select name="platOrange" style="padding:5px 8px;border-radius:6px">
+<option value="connectpro"${(u.cfg.platforms&&u.cfg.platforms.ORANGE==='yapson')?'':' selected'}>ConnectPro</option>
+<option value="yapson"${(u.cfg.platforms&&u.cfg.platforms.ORANGE==='yapson')?' selected':''}>yapson-transfer</option>
+</select></span>
+</div>
+<div style="font-size:10px;color:var(--m);margin-top:6px">MTN / Moov restent sur ConnectPro. yapson-transfer nécessite le jeton ci-dessus.</div>
 </div></div>
 <div><div class="seclbl" style="color:var(--g)">my-managment.com</div>
 <div class="frow"><label>Cookies de session</label>
@@ -653,8 +738,13 @@ app.get('/dashboard',requireLogin,(req,res)=>{const u=users[req.session.userId];
 
 app.post('/user/save-accounts',requireLogin,(req,res)=>{
   const u=users[req.session.userId];if(!u)return res.redirect('/login');
-  const{connectproToken,mgmtCookies}=req.body;
+  const{connectproToken,mgmtCookies,yapsonToken,platWave,platOrange}=req.body;
   if(connectproToken&&!connectproToken.startsWith('●')){u.cfg.connectproToken=connectproToken.trim();ulog(u,'ok','🔑 Token ConnectPro mis à jour');}
+  if(yapsonToken&&!yapsonToken.startsWith('●')){u.cfg.yapsonToken=yapsonToken.trim();ulog(u,'ok','🟢 Jeton yapson-transfer mis à jour');}
+  if(!u.cfg.platforms)u.cfg.platforms={WAVE:'connectpro',ORANGE:'connectpro'};
+  if(platWave==='connectpro'||platWave==='yapson')u.cfg.platforms.WAVE=platWave;
+  if(platOrange==='connectpro'||platOrange==='yapson')u.cfg.platforms.ORANGE=platOrange;
+  ulog(u,'ok',`⚙ Plateformes — Wave: ${u.cfg.platforms.WAVE} · Orange: ${u.cfg.platforms.ORANGE}`);
   if(mgmtCookies){const t=mgmtCookies.trim();const ok=t.startsWith('[')||/^[a-zA-Z_][a-zA-Z0-9_]*=/.test(t);const bad=t.includes('configuré')||t.includes('(coller')||t.startsWith('(');if(ok&&!bad){u.cfg.mgmtCookies=t;ulog(u,'ok',`🍪 Cookies mis à jour — ${parseCookies(t).split(';').length} cookie(s)`);}}
   ulog(u,'ok','Comptes sauvegardés');
   saveUser(u);
