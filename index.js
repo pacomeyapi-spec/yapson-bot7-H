@@ -374,7 +374,8 @@ const YAPSON_URL = (process.env.YAPSON_URL || 'https://yapson-transfer-productio
 // WAVE / ORANGE : connectpro (défaut) | yapson. MTN/Moov : connectpro (inchangé).
 function choosePlatform(u, operator) {
   const sel = (u.cfg.platforms && u.cfg.platforms[operator]) || '';
-  if ((operator === 'WAVE' || operator === 'ORANGE') && sel === 'yapson' && u.cfg.yapsonToken) return 'yapson';
+  if (operator === 'WAVE'   && (sel === 'yapson' || sel === 'yapson_perso') && u.cfg.yapsonToken) return 'yapson';
+  if (operator === 'ORANGE' && sel === 'yapson' && u.cfg.yapsonToken) return 'yapson';
   return 'connectpro';
 }
 async function createYapsonPayout(u, { operator, amount, phone, recipientName, ref }) {
@@ -454,7 +455,8 @@ async function runCycle(u) {
         // 0. Choix de plateforme par opérateur (Wave/Orange → yapson si configuré, sinon ConnectPro)
         const operator = network === 'Wave' ? 'WAVE' : ((network === 'Orangeint' || network === 'ORANGE CI') ? 'ORANGE' : null);
         if (operator && choosePlatform(u, operator) === 'yapson') {
-          await handleYapsonItem(u, item, operator);
+          const yapsonOperator = (operator === 'WAVE' && u.cfg.platforms && u.cfg.platforms.WAVE === 'yapson_perso') ? 'WAVE_PERSO' : operator;
+          await handleYapsonItem(u, item, yapsonOperator);
           processed = true; break;
         }
 
@@ -622,8 +624,9 @@ ${u.cfg.yapsonToken?'<span class="tag-ok">✓ Actif</span>':'<span class="tag-er
 <div class="frow"><label>Plateforme par opérateur</label>
 <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;font-size:12px">
 <span>Wave : <select name="platWave" style="padding:5px 8px;border-radius:6px">
-<option value="connectpro"${(u.cfg.platforms&&u.cfg.platforms.WAVE==='yapson')?'':' selected'}>ConnectPro</option>
-<option value="yapson"${(u.cfg.platforms&&u.cfg.platforms.WAVE==='yapson')?' selected':''}>yapson-transfer</option>
+<option value="connectpro"${(u.cfg.platforms&&(u.cfg.platforms.WAVE==='yapson'||u.cfg.platforms.WAVE==='yapson_perso'))?'':' selected'}>ConnectPro</option>
+<option value="yapson"${(u.cfg.platforms&&u.cfg.platforms.WAVE==='yapson')?' selected':''}>yapson — Wave business</option>
+<option value="yapson_perso"${(u.cfg.platforms&&u.cfg.platforms.WAVE==='yapson_perso')?' selected':''}>yapson — Wave personnel</option>
 </select></span>
 <span>Orange : <select name="platOrange" style="padding:5px 8px;border-radius:6px">
 <option value="connectpro"${(u.cfg.platforms&&u.cfg.platforms.ORANGE==='yapson')?'':' selected'}>ConnectPro</option>
@@ -742,7 +745,7 @@ app.post('/user/save-accounts',requireLogin,(req,res)=>{
   if(connectproToken&&!connectproToken.startsWith('●')){u.cfg.connectproToken=connectproToken.trim();ulog(u,'ok','🔑 Token ConnectPro mis à jour');}
   if(yapsonToken&&!yapsonToken.startsWith('●')){u.cfg.yapsonToken=yapsonToken.trim();ulog(u,'ok','🟢 Jeton yapson-transfer mis à jour');}
   if(!u.cfg.platforms)u.cfg.platforms={WAVE:'connectpro',ORANGE:'connectpro'};
-  if(platWave==='connectpro'||platWave==='yapson')u.cfg.platforms.WAVE=platWave;
+  if(platWave==='connectpro'||platWave==='yapson'||platWave==='yapson_perso')u.cfg.platforms.WAVE=platWave;
   if(platOrange==='connectpro'||platOrange==='yapson')u.cfg.platforms.ORANGE=platOrange;
   ulog(u,'ok',`⚙ Plateformes — Wave: ${u.cfg.platforms.WAVE} · Orange: ${u.cfg.platforms.ORANGE}`);
   if(mgmtCookies){const t=mgmtCookies.trim();const ok=t.startsWith('[')||/^[a-zA-Z_][a-zA-Z0-9_]*=/.test(t);const bad=t.includes('configuré')||t.includes('(coller')||t.startsWith('(');if(ok&&!bad){u.cfg.mgmtCookies=t;ulog(u,'ok',`🍪 Cookies mis à jour — ${parseCookies(t).split(';').length} cookie(s)`);}}
